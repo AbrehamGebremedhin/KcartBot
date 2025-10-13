@@ -489,7 +489,7 @@ class MilvusHandler:
             collection = self.get_collection(collection_name)
             
             # Load collection if not loaded
-            if collection.load_state != LoadState.Loaded:
+            if not self.is_collection_loaded(collection_name):
                 collection.load()
             
             results = collection.query(
@@ -564,8 +564,34 @@ class MilvusHandler:
         Returns:
             Load state string
         """
-        collection = self.get_collection(collection_name)
-        return str(collection.load_state)
+        try:
+            state = utility.load_state(collection_name, using=self.alias)
+            return str(state)
+        except Exception:
+            collection = self.get_collection(collection_name)
+            load_attr = getattr(collection, "load_state", None)
+            return str(load_attr) if load_attr is not None else "unknown"
+
+    def is_collection_loaded(self, collection_name: str) -> bool:
+        """Return True when a collection is loaded in memory."""
+        try:
+            state = utility.load_state(collection_name, using=self.alias)
+            return state == LoadState.Loaded
+        except Exception:
+            try:
+                collection = self.get_collection(collection_name)
+            except Exception:
+                return False
+            has_load_attr = getattr(collection, "has_load", None)
+            if callable(has_load_attr):
+                try:
+                    return bool(has_load_attr())
+                except Exception:
+                    pass
+            load_attr = getattr(collection, "load_state", None)
+            if load_attr is not None:
+                return str(load_attr) in {"LoadState.Loaded", "Loaded"}
+            return False
     
     # ========== Partition Management ==========
     
@@ -640,7 +666,7 @@ class MilvusHandler:
             "row_count": collection.num_entities,
             "schema": str(collection.schema),
             "partitions": len(collection.partitions),
-            "load_state": str(collection.load_state),
+            "load_state": self.get_load_state(collection_name),
         }
     
     def get_entity_count(

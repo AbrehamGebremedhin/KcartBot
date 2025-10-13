@@ -255,6 +255,13 @@ class IntentClassifierPayload(BaseModel):
 CLASSIFIER_SYSTEM_PROMPT = f"""
 You are the intent classification module for KCartBot. Analyse the most recent user utterance and map it to one of the supported intents.
 
+IMPORTANT: If the user says something like "okay", "yes", "sure", "go ahead", "sounds good", etc., check the conversation context to understand what they are confirming:
+- If previous context shows supplier onboarding in progress, classify as "intent.supplier.register"
+- If previous context shows customer onboarding in progress, classify as "intent.customer.register"
+- If confirming an order, classify as "intent.customer.confirm_order"
+- If confirming a flash sale action, classify as appropriate flash sale intent
+- Use the context to infer the actual intent behind the confirmation
+
 Each intent belongs to exactly one flow (customer or supplier) and is described below:
 {INTENT_CATALOG_TEXT}
 
@@ -266,7 +273,7 @@ Return a compact JSON object with the following keys:
 - missing_slots: list of slots still required before fulfilment.
 - rationale: short natural language explanation (max 25 words).
 
-If no intent reasonably matches, set intent to "intent.unknown" and flow to "unknown" with confidence under 0.4.
+If no intent reasonably matches AND there's no context to understand a confirmation, set intent to "intent.unknown" and flow to "unknown" with confidence under 0.4.
 
 Always respond with JSON only. Avoid markdown fences or commentary.
 """
@@ -297,7 +304,7 @@ class IntentClassifierTool(ToolBase):
 	async def run(self, input: Any, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 		"""Classify the provided text and return structured metadata."""
 		if isinstance(input, dict):
-			utterance = input.get("text") or input.get("utterance") or ""
+			utterance = input.get("text") or input.get("utterance") or input.get("message") or ""
 		else:
 			utterance = str(input or "")
 
@@ -311,16 +318,37 @@ class IntentClassifierTool(ToolBase):
 				"rationale": "No user utterance provided.",
 			}
 
+		# Extract chat history from context for better classification
+		chat_history = []
+		if context and "chat_history" in context:
+			chat_history = context["chat_history"]
+			# Keep only last 3 exchanges to avoid token overflow
+			if len(chat_history) > 6:
+				chat_history = chat_history[-6:]
+
+		# Format history for the classifier
+		history_text = ""
+		if chat_history:
+			history_text = "Recent conversation:\n"
+			for msg in chat_history:
+				role = msg.get("role", "user")
+				content = msg.get("content", "")
+				history_text += f"{role}: {content}\n"
+
 		extra_context = ""
 		if context:
-			try:
-				extra_context = json.dumps(context, ensure_ascii=False)
-			except Exception:
-				extra_context = str(context)
+			# Filter out chat_history from extra context to avoid duplication
+			filtered_context = {k: v for k, v in context.items() if k != "chat_history"}
+			if filtered_context:
+				try:
+					extra_context = json.dumps(filtered_context, ensure_ascii=False)
+				except Exception:
+					extra_context = str(filtered_context)
 
 		prompt = (
-			f"Utterance: {utterance}\n"
-			f"Conversation context: {extra_context or 'null'}\n"
+			f"{history_text}\n"
+			f"Current utterance: {utterance}\n"
+			f"Session context: {extra_context or 'null'}\n"
 			"Respond with JSON only."
 		)
 

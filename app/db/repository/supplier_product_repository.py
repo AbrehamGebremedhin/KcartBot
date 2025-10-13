@@ -16,10 +16,11 @@ class SupplierProductRepository:
         # Post-save: create a proposed flash sale if product is near expiry
         expiry_date = getattr(supplier_product, 'expiry_date', None)
         status = getattr(supplier_product, 'status', None)
+        current_date = datetime.utcnow().date()
         if (
             expiry_date
             and status in {SupplierProductStatus.ON_SALE, SupplierProductStatus.ACTIVE}
-            and expiry_date <= (datetime.utcnow().date() + timedelta(days=3))
+            and current_date <= expiry_date <= (current_date + timedelta(days=3))
         ):
             end_date = datetime.combine(expiry_date, time.max)
             await FlashSaleRepository.create_or_get_proposal(
@@ -56,9 +57,23 @@ class SupplierProductRepository:
 
     @staticmethod
     async def list_supplier_products(filters=None):
-        query = SupplierProduct.all()
+        query = SupplierProduct.all().prefetch_related('product')
         if filters:
             for key, value in filters.items():
+                if key in {"product_name", "product_name_en"}:
+                    if isinstance(value, dict):
+                        lookup = value.get("lookup", "exact")
+                        target = value.get("value")
+                        if target is None:
+                            continue
+                        lookup_suffix = f"__{lookup}" if lookup and lookup != "exact" else ""
+                        query = query.filter(**{f"product__product_name_en{lookup_suffix}": target})
+                    else:
+                        query = query.filter(product__product_name_en=value)
+                    continue
+                if key in {"product_label"}:
+                    query = query.filter(product__product_name_en=value)
+                    continue
                 if isinstance(value, dict):
                     query = query.filter(**{f"{key}__{value['lookup']}": value['value']})
                 else:
@@ -69,11 +84,14 @@ class SupplierProductRepository:
     async def get_expiring_products(supplier_id: int, within_days: int = 3) -> List[SupplierProduct]:
         """Return supplier products that will expire within the given horizon."""
         horizon = datetime.utcnow().date() + timedelta(days=within_days)
+        current_date = datetime.utcnow().date()
         query = SupplierProduct.filter(
             supplier_id=supplier_id,
             expiry_date__isnull=False,
             expiry_date__lte=horizon,
+            expiry_date__gte=current_date,
             quantity_available__gt=0,
+            status__in=[SupplierProductStatus.ACTIVE, SupplierProductStatus.ON_SALE],
         )
         return await query
 

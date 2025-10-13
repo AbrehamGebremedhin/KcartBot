@@ -7,6 +7,12 @@ class UserRepository:
         return await User.create(**kwargs)
 
     @staticmethod
+    async def get_user_by_name(name: str):
+        if not name:
+            return None
+        return await User.filter(name__iexact=name).first()
+
+    @staticmethod
     async def get_user_by_id(user_id):
         try:
             return await User.get(user_id=user_id)

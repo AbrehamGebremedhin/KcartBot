@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from tortoise.exceptions import DoesNotExist
 
-from app.db.models import FlashSale, FlashSaleStatus, SupplierProduct
+from app.db.models import FlashSale, FlashSaleStatus, SupplierProduct, SupplierProductStatus
 
 
 class FlashSaleRepository:
@@ -43,9 +43,18 @@ class FlashSaleRepository:
         discount_percent: float,
         start_date,
         end_date,
-    ) -> Tuple[FlashSale, bool]:
+    ) -> Tuple[Optional[FlashSale], bool]:
         """Ensure there is a proposed flash sale for the given supplier product."""
         await supplier_product.fetch_related("supplier", "product")
+        current_date = datetime.utcnow().date()
+        allowed_statuses = {SupplierProductStatus.ACTIVE, SupplierProductStatus.ON_SALE}
+        expiry_date = getattr(supplier_product, "expiry_date", None)
+        if (
+            getattr(supplier_product, "status", None) not in allowed_statuses
+            or not expiry_date
+            or expiry_date < current_date
+        ):
+            return None, False
         existing = await FlashSale.filter(
             supplier_product=supplier_product,
             status__in=[
@@ -55,6 +64,15 @@ class FlashSaleRepository:
             ],
         ).order_by("-created_at").first()
         if existing:
+            await existing.fetch_related("supplier_product")
+            sp_status = getattr(getattr(existing, "supplier_product", None), "status", None)
+            sp_expiry = getattr(getattr(existing, "supplier_product", None), "expiry_date", None)
+            if (
+                sp_status not in allowed_statuses
+                or (sp_expiry and sp_expiry < current_date)
+            ):
+                await FlashSaleRepository.cancel_flash_sale(existing.id)
+                return None, False
             return existing, False
         created = await FlashSaleRepository.create_flash_sale(
             supplier_product=supplier_product,
@@ -108,6 +126,24 @@ class FlashSaleRepository:
         )
         await flash_sale.save()
         return flash_sale
+
+    @staticmethod
+    async def update_flash_sale(flash_sale_id, **kwargs):
+        flash_sale = await FlashSaleRepository.get_flash_sale_by_id(flash_sale_id)
+        if not flash_sale:
+            return None
+        for key, value in kwargs.items():
+            setattr(flash_sale, key, value)
+        await flash_sale.save()
+        return flash_sale
+
+    @staticmethod
+    async def delete_flash_sale(flash_sale_id):
+        flash_sale = await FlashSaleRepository.get_flash_sale_by_id(flash_sale_id)
+        if not flash_sale:
+            return False
+        await flash_sale.delete()
+        return True
 
     @staticmethod
     async def get_flash_sale_by_id(flash_sale_id):

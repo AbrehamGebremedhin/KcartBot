@@ -70,9 +70,12 @@ Why this layout?
 2. **Create `.env`** (adjust values to your environment):
 
    ```dotenv
+   DEEPSEEK_API_KEY=your-deepseek-key
    GEMINI_API_KEY=your-google-genai-key
    DATABASE_URL=postgres://kcartbot:kcartbot@localhost:5432/kcartbot
    ```
+
+   The chat orchestration now uses DeepSeek (`DEEPSEEK_API_KEY`), while Gemini remains available for image generation and data utilities.
 
 3. **Provision databases** (example Docker commands):
 

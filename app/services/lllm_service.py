@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
-import os
+import json
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Iterable, List, Mapping, Optional
+from typing import Any, AsyncGenerator, AsyncIterator, Iterable, List, Mapping, Optional
+
+import httpx
 
 from langchain_core.caches import BaseCache as _LCBaseCache  # type: ignore
 from langchain_core.callbacks import Callbacks as _LCCallbacks  # type: ignore
-from google import genai
-from google.genai import types
+
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -18,23 +21,23 @@ logger.setLevel(logging.INFO)
 @dataclass
 class LLMConfig:
     """Configuration for AsyncLLMService."""
-    model: str = "gemini-2.0-flash-lite"  # Gemini model name
+    model: str = "deepseek-chat"
     temperature: float = 0.2
     max_retries: int = 3
     retry_backoff: float = 0.5  # seconds
-    api_key: Optional[str] = field(default_factory=lambda: os.getenv("GEMINI_API_KEY"))
+    api_key: Optional[str] = None
+    base_url: str = "https://api.deepseek.com/v1"
     extra_kwargs: Mapping[str, object] = field(default_factory=dict)
 
 
 class LLMService:
-    """Asynchronous LLM service using Google Gemini via google-generativeai."""
+    """Asynchronous LLM service targeting the DeepSeek Chat API."""
 
     def __init__(
         self,
         system_prompt: Optional[str] = None,
         config: Optional[LLMConfig] = None,
-        model: Optional[Any] = None,
-        client: Optional[genai.Client] = None,
+        http_client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         self.config = config or LLMConfig()
         self.system_prompt = system_prompt or (
@@ -177,36 +180,88 @@ class LLMService:
 
             Remember: Be helpful, natural, and efficient. Guide users through flows conversationally, don't dump information. You're a knowledgeable friend helping them buy/sell fresh produce, not a robotic form-filler."""
         )
-        if client is not None:
-            self._client = client
-        else:
-            if not self.config.api_key:
-                raise RuntimeError("GEMINI_API_KEY is not set in environment or config.")
-            self._client = genai.Client(api_key=self.config.api_key)
+        if not self.config.api_key:
+            settings = get_settings()
+            self.config.api_key = getattr(settings, "deepseek_api_key", None) or getattr(settings, "gemini_api_key", None)
 
-        if model is not None:
-            # Backward compatibility: allow passing pre-built GenerativeModel
-            self._model_name = getattr(model, "model_name", self.config.model)
-            self._legacy_model = model
-        else:
-            self._model_name = self.config.model
-            self._legacy_model = None
+        if not self.config.api_key:
+            raise RuntimeError("DEEPSEEK_API_KEY is not set in configuration or environment.")
 
-    def _build_generation_config(self) -> types.GenerateContentConfig:
-        base_kwargs = dict(self.config.extra_kwargs)
-        # Ensure temperature always present for reproducibility
-        base_kwargs.setdefault("temperature", self.config.temperature)
-        try:
-            return types.GenerateContentConfig(
-                system_instruction=self.system_prompt,
-                **base_kwargs,
+        self._external_client = http_client
+        self._request_timeout = 60.0
+
+    def _headers(self) -> Mapping[str, str]:
+        return {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def _build_payload(
+        self,
+        prompt: str,
+        history: Optional[Iterable[Mapping[str, str]]],
+        *,
+        stream: bool = False,
+    ) -> Mapping[str, Any]:
+        messages = self._compose_messages(prompt, history)
+        payload: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": self.config.temperature,
+            **self.config.extra_kwargs,
+        }
+        if stream:
+            payload["stream"] = True
+        return payload
+
+    async def _post_json(self, payload: Mapping[str, Any]) -> httpx.Response:
+        url = f"{self.config.base_url}/chat/completions"
+        headers = self._headers()
+        timeout = httpx.Timeout(self._request_timeout)
+
+        if self._external_client is not None:
+            response = await self._external_client.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=timeout,
             )
-        except TypeError:
-            # Fall back to minimal supported configuration if extras are invalid
-            return types.GenerateContentConfig(
-                temperature=self.config.temperature,
-                system_instruction=self.system_prompt,
-            )
+        else:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(url, json=payload, headers=headers)
+
+        response.raise_for_status()
+        return response
+
+    @asynccontextmanager
+    async def _stream_request(self, payload: Mapping[str, Any]) -> AsyncIterator[httpx.Response]:
+        url = f"{self.config.base_url}/chat/completions"
+        headers = self._headers()
+        timeout = httpx.Timeout(None, connect=self._request_timeout)
+
+        if self._external_client is not None:
+            async with self._external_client.stream(
+                "POST",
+                url,
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+            ) as response:
+                response.raise_for_status()
+                yield response
+        else:
+            client = httpx.AsyncClient(timeout=timeout)
+            try:
+                async with client.stream(
+                    "POST",
+                    url,
+                    json=payload,
+                    headers=headers,
+                ) as response:
+                    response.raise_for_status()
+                    yield response
+            finally:
+                await client.aclose()
 
     def update_system_prompt(self, system_prompt: str) -> None:
         """Update the system prompt for future requests."""
@@ -217,8 +272,7 @@ class LLMService:
         return LLMService(
             system_prompt=system_prompt or self.system_prompt,
             config=self.config,
-            model=self._legacy_model,
-            client=self._client,
+            http_client=self._external_client,
         )
 
     async def acomplete(
@@ -229,27 +283,16 @@ class LLMService:
         **kwargs,
     ) -> str:
         """Generate a single-shot completion asynchronously with retries."""
-        messages = self._compose_messages(prompt, history)
+        payload = self._build_payload(prompt, history)
 
-        async def _call():
-            # google-generativeai does not support async, so run in executor
-            import concurrent.futures
-            loop = asyncio.get_event_loop()
-            def sync_call():
-                config_obj = self._build_generation_config()
-                if self._legacy_model is not None:
-                    response = self._legacy_model.generate_content(
-                        messages,
-                        config=config_obj,
-                    )
-                else:
-                    response = self._client.models.generate_content(
-                        model=self._model_name,
-                        contents=messages,
-                        config=config_obj,
-                    )
-                return response.text if hasattr(response, "text") else str(response)
-            return await loop.run_in_executor(None, sync_call)
+        async def _call() -> str:
+            response = await self._post_json(payload)
+            data = response.json()
+            try:
+                content = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError) as exc:  # pragma: no cover - defensive
+                raise RuntimeError(f"Unexpected DeepSeek response structure: {data}") from exc
+            return content.strip()
 
         return await self._retry(_call, action="completion")
 
@@ -261,32 +304,30 @@ class LLMService:
         **kwargs,
     ) -> AsyncGenerator[str, None]:
         """Stream the model's response tokens asynchronously with retries."""
-        messages = self._compose_messages(prompt, history)
+        payload = self._build_payload(prompt, history, stream=True)
 
         async def _gen():
-            import concurrent.futures
-            loop = asyncio.get_event_loop()
-            def sync_stream():
-                config_obj = self._build_generation_config()
-                if self._legacy_model is not None:
-                    generator = self._legacy_model.generate_content(
-                        messages,
-                        stream=True,
-                        config=config_obj,
-                    )
-                else:
-                    generator = self._client.models.generate_content(
-                        model=self._model_name,
-                        contents=messages,
-                        stream=True,
-                        config=config_obj,
-                    )
-
-                for chunk in generator:
-                    yield chunk.text if hasattr(chunk, "text") else str(chunk)
-            # Wrap sync generator as async
-            for token in await loop.run_in_executor(None, lambda: list(sync_stream())):
-                yield token
+            async with self._stream_request(payload) as stream:
+                async for line in stream.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith(":"):
+                        continue  # comment/heartbeat
+                    if line.strip() == "data: [DONE]":
+                        break
+                    if not line.startswith("data: "):
+                        continue
+                    raw = line.split("data: ", 1)[1].strip()
+                    if not raw:
+                        continue
+                    try:
+                        event = json.loads(raw)
+                        delta = event["choices"][0]["delta"].get("content")
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        logger.debug("Skipping malformed DeepSeek stream chunk: %s", raw)
+                        continue
+                    if delta:
+                        yield delta
 
         for attempt in range(self.config.max_retries):
             try:
@@ -304,22 +345,24 @@ class LLMService:
         self,
         prompt: str,
         history: Optional[Iterable[Mapping[str, str]]],
-    ) -> List[types.Content]:
-        """Build Gemini content payload from history and prompt."""
-        messages: List[types.Content] = []
+    ) -> List[Mapping[str, str]]:
+        messages: List[Mapping[str, str]] = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt.strip()})
+
         if history:
             for item in history:
-                role = (item.get("role") or "").lower()
-                content = item.get("content") or ""
+                role = (item.get("role") or "user").lower()
+                content = (item.get("content") or "").strip()
                 if not content:
                     continue
-                mapped_role = "model" if role == "assistant" else "user"
-                messages.append(
-                    types.Content(role=mapped_role, parts=[types.Part(text=content)])
-                )
-        messages.append(
-            types.Content(role="user", parts=[types.Part(text=prompt)])
-        )
+                mapped_role = {
+                    "assistant": "assistant",
+                    "system": "system",
+                }.get(role, "user")
+                messages.append({"role": mapped_role, "content": content})
+
+        messages.append({"role": "user", "content": prompt})
         return messages
 
     async def _retry(self, func, *, action: str):
@@ -337,10 +380,20 @@ class LLMService:
     def _should_retry(self, e: Exception, attempt: int) -> bool:
         if attempt >= self.config.max_retries - 1:
             return False
-        transient_errors = ("Connection refused", "Timeout", "Temporary failure", "429", "quota")
-        return any(err.lower() in str(e).lower() for err in transient_errors)
+        transient_errors = (
+            "connection refused",
+            "timeout",
+            "temporary failure",
+            "429",
+            "rate limit",
+            "overloaded",
+        )
+        message = str(e).lower()
+        if any(err in message for err in transient_errors):
+            return True
+        return isinstance(e, (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError))
 
     def _raise_llm_error(self, e: Exception) -> None:
         raise RuntimeError(
-            f"LLM request failed: {e}. Verify your Gemini API key and model '{self.config.model}' is available."
+            f"LLM request failed: {e}. Verify your DeepSeek API key and model '{self.config.model}' is available."
         ) from e

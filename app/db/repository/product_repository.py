@@ -7,6 +7,12 @@ class ProductRepository:
         return await Product.create(**kwargs)
 
     @staticmethod
+    async def get_product_by_name(name: str):
+        if not name:
+            return None
+        return await Product.filter(product_name_en__iexact=name).first()
+
+    @staticmethod
     async def get_product_by_id(product_id):
         try:
             return await Product.get(product_id=product_id)

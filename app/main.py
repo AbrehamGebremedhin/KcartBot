@@ -3,6 +3,7 @@
 from fastapi import FastAPI
 
 from app.api.routes import router as api_router
+from app.core.tortoise_config import init_db, close_db
 
 
 APP_DESCRIPTION = (
@@ -35,6 +36,18 @@ app = FastAPI(
 	openapi_tags=TAGS_METADATA,
 )
 app.include_router(api_router, prefix="/api")
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+	"""Initialise database connections when the API boots."""
+	await init_db()
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+	"""Gracefully close database connections on shutdown."""
+	await close_db()
 
 
 @app.get("/", tags=["meta"], summary="KcartBot overview")

@@ -91,8 +91,7 @@ class VectorSearchTool(ToolBase):
                 )
             
             # Load collection into memory for searching
-            collection = self.milvus.get_collection(self.collection_name)
-            if collection.load_state != "Loaded":
+            if not self.milvus.is_collection_loaded(self.collection_name):
                 await self.milvus.load_collection(self.collection_name)
                 logger.info(f"Loaded collection '{self.collection_name}' into memory")
 

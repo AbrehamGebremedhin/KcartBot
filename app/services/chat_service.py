@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from app.agents.agent import AgentTurn, KcartAgent
-from app.db.models import FlashSaleStatus, TransactionStatus, UserRole
+from app.db.models import (
+	FlashSaleStatus,
+	SupplierProductStatus,
+	TransactionStatus,
+	UserRole,
+)
 from app.db.repository.flash_sale_repository import FlashSaleRepository
 from app.db.repository.order_item_repository import OrderItemRepository
 from app.db.repository.supplier_product_repository import SupplierProductRepository
@@ -287,6 +293,20 @@ class ChatService:
 				"status": FlashSaleStatus.PROPOSED,
 			}
 		)
+		valid_proposals: List[Any] = []
+		for sale in proposed_sales:
+			await sale.fetch_related("product", "supplier_product")
+			supplier_product = getattr(sale, "supplier_product", None)
+			sp_status = getattr(supplier_product, "status", None)
+			sp_expiry = getattr(supplier_product, "expiry_date", None)
+			if (
+				sp_status in {SupplierProductStatus.ACTIVE, SupplierProductStatus.ON_SALE}
+				and sp_expiry is not None
+				and sp_expiry >= date.today()
+			):
+				valid_proposals.append(sale)
+			else:
+				await FlashSaleRepository.cancel_flash_sale(sale.id)
 
 		lines: List[str] = []
 		if pending_orders:
@@ -311,13 +331,11 @@ class ChatService:
 				f"Next scheduled flash sale kicks off on {next_sale.start_date.strftime('%d %b %Y %H:%M')}."
 			)
 
-		if proposed_sales:
-			for sale in proposed_sales:
-				await sale.fetch_related("product")
-			product_names = [sale.product.product_name_en for sale in proposed_sales if getattr(sale, "product", None)]
-			recommendation = ", ".join(product_names[:3]) if product_names else f"{len(proposed_sales)} items"
+		if valid_proposals:
+			product_names = [sale.product.product_name_en for sale in valid_proposals if getattr(sale, "product", None)]
+			recommendation = ", ".join(product_names[:3]) if product_names else f"{len(valid_proposals)} items"
 			lines.append(
-				f"⚠️ {len(proposed_sales)} item{'s' if len(proposed_sales) != 1 else ''} close to expiry ready for flash sale ({recommendation}). "
+				f"⚠️ {len(valid_proposals)} item{'s' if len(valid_proposals) != 1 else ''} close to expiry ready for flash sale ({recommendation}). "
 				"Tell me to accept or decline a proposal when you're ready."
 			)
 		elif expiring_products:

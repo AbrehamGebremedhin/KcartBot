@@ -4,6 +4,7 @@ from app.tools.generate_image import ImageGeneratorTool
 from app.tools.flash_sale import FlashSaleTool
 from app.tools.intent_classifier import IntentClassifierTool
 from app.tools.search_context import VectorSearchTool, get_vector_search_tool
+from app.tools.schedule_tool import ScheduleTool
 
 __all__ = [
     'ToolBase',
@@ -14,4 +15,5 @@ __all__ = [
     'IntentClassifierTool',
     'VectorSearchTool',
     'get_vector_search_tool',
+    'ScheduleTool',
 ]

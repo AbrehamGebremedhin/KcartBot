@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     """
 
     gemini_api_key: str = Field(..., alias='GEMINI_API_KEY', description="API key for Gemini services")
+    deepseek_api_key: str = Field(..., alias='DEEPSEEK_API_KEY', description="API key for DeepSeek services")
     DATABASE_URL: str = Field(..., alias='DATABASE_URL', description="Database connection URL")
 
     model_config = {
