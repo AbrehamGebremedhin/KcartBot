@@ -1,6 +1,7 @@
 """Vector search tool for RAG (Retrieval-Augmented Generation) using Milvus."""
 
 from typing import Any, Dict, List, Optional
+import asyncio
 import json
 import logging
 
@@ -349,10 +350,24 @@ class VectorSearchTool(ToolBase):
         
         return "\n".join(context_parts)
 
+    async def aclose(self) -> None:
+        """Asynchronously close open Milvus connections."""
+        if not self._connected or not self.milvus.is_connected():
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.milvus.disconnect)
+        self._connected = False
+
     def __del__(self):
         """Cleanup: disconnect from Milvus."""
         try:
             if self._connected and self.milvus.is_connected():
                 self.milvus.disconnect()
+                self._connected = False
         except Exception:
             pass
+
+
+def get_vector_search_tool(**kwargs) -> VectorSearchTool:
+    """Convenience factory mirroring previous public API."""
+    return VectorSearchTool(**kwargs)

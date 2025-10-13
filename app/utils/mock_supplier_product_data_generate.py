@@ -129,23 +129,11 @@ async def generate_mock_supplier_products():
 
 async def insert_mock_supplier_products():
     """Insert mock supplier products into the database"""
-    await Tortoise.init(config={
-        "connections": {
-            "default": get_settings().DATABASE_URL
-        },
-        "apps": {
-            "models": {
-                "models": ["app.db.models"],
-                "default_connection": "default"
-            }
-        }
-    })
-    
+    from app.db.repository.supplier_product_repository import SupplierProductRepository
     data = await generate_mock_supplier_products()
     count = 0
-    
     for item in data:
-        await SupplierProduct.create(
+        await SupplierProductRepository.create_supplier_product(
             inventory_id=item["inventory_id"],
             supplier_id=item["supplier_id"],
             product_id=item["product_id"],
@@ -157,9 +145,7 @@ async def insert_mock_supplier_products():
             status=SupplierProductStatus(item["status"])
         )
         count += 1
-    
     print(f"Successfully inserted {count} supplier product entries")
-    await Tortoise.close_connections()
 
 
 async def print_mock_supplier_products():

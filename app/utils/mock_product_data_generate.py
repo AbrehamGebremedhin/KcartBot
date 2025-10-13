@@ -108,21 +108,10 @@ def generate_mock_products():
 
 
 async def insert_mock_products():
-	await Tortoise.init(config={
-		"connections": {
-			"default": get_settings().DATABASE_URL
-		},
-		"apps": {
-			"models": {
-				"models": ["app.db.models"],
-				"default_connection": "default"
-			}
-		}
-	})
-	await Tortoise.generate_schemas()
+	from app.db.repository.product_repository import ProductRepository
 	data = generate_mock_products()
 	for item in data:
-		await Product.create(
+		await ProductRepository.create_product(
 			product_id=item["product_id"],
 			product_name_en=item["product_name_en"],
 			product_name_am=item["product_name_am"],
@@ -135,7 +124,6 @@ async def insert_mock_products():
 			image_url=item["image_url"],
 			created_at=datetime.strptime(item["created_at"], "%Y-%m-%d %H:%M:%S")
 		)
-	await Tortoise.close_connections()
 
 def print_mock_products():
 	import json

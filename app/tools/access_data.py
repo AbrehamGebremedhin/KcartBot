@@ -7,6 +7,44 @@ from app.db.repository.supplier_product_repository import SupplierProductReposit
 from app.db.repository.competitor_price_repository import CompetitorPriceRepository
 from app.db.repository.transaction_repository import TransactionRepository
 from app.db.repository.order_item_repository import OrderItemRepository
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+
+class DataAccessRequest(BaseModel):
+    entity: str = Field(description="Target entity name, e.g. products")
+    operation: str = Field(default="list", description="Operation to execute: list|get|search")
+    id: Optional[Any] = Field(default=None, description="Identifier for get operations")
+    filters: Dict[str, Any] = Field(default_factory=dict, description="Filter criteria")
+    limit: Optional[int] = Field(default=None, ge=1, le=500, description="Optional row limit")
+
+    @field_validator("entity", mode="before")
+    @classmethod
+    def _lower_entity(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise TypeError("entity must be a string")
+        return value.strip().lower()
+
+    @field_validator("operation", mode="before")
+    @classmethod
+    def _lower_operation(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise TypeError("operation must be a string")
+        return value.strip().lower()
+
+
+class AnalyticsRequest(BaseModel):
+    operation: str = Field(description="Analytics operation to execute")
+    product_id: Optional[str] = None
+    user_id: Optional[int] = None
+    supplier_id: Optional[int] = None
+    filters: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("operation", mode="before")
+    @classmethod
+    def _lower_operation(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise TypeError("operation must be a string")
+        return value.strip().lower()
 
 
 class DataAccessTool(ToolBase):
@@ -37,60 +75,46 @@ class DataAccessTool(ToolBase):
         }
 
     async def run(self, input: Dict[str, Any], context: Dict[str, Any] = None) -> Any:
-        """
-        Execute data access operations.
-        
-        Args:
-            input: Dictionary containing:
-                - entity: str - The entity type to query ('users', 'products', etc.)
-                - operation: str - The operation to perform ('list', 'get', 'search')
-                - id: Optional - The ID of the entity to retrieve (for 'get' operation)
-                - filters: Optional[Dict] - Filters to apply when listing/searching
-                - limit: Optional[int] - Maximum number of results to return
-            context: Optional context dictionary
-            
-        Returns:
-            Query results as a list of dictionaries or a single dictionary
-        """
+        """Execute validated data access operations and surface friendly errors."""
         try:
-            # Parse input if it's a string
             if isinstance(input, str):
                 try:
                     input = json.loads(input)
                 except json.JSONDecodeError:
-                    return {"error": "Invalid JSON input"}
-            
-            # Extract parameters
-            entity = input.get('entity', '').lower()
-            operation = input.get('operation', 'list').lower()
-            entity_id = input.get('id')
-            filters = input.get('filters', {})
-            limit = input.get('limit')
-            
-            # Validate entity
-            if entity not in self.repositories:
-                return {
-                    "error": f"Unknown entity: {entity}. "
-                    f"Valid entities are: {', '.join(self.repositories.keys())}"
-                }
-            
-            repository = self.repositories[entity]
-            
-            # Execute operation
-            if operation == 'get':
-                return await self._get_by_id(repository, entity, entity_id)
-            elif operation == 'list':
-                return await self._list_entities(repository, filters, limit)
-            elif operation == 'search':
-                return await self._search_entities(repository, filters, limit)
-            else:
-                return {
-                    "error": f"Unknown operation: {operation}. "
-                    f"Valid operations are: 'list', 'get', 'search'"
-                }
-                
-        except Exception as e:
-            return {"error": f"Error accessing data: {str(e)}"}
+                    return {"error": "Invalid JSON payload for data_access tool."}
+
+            request = DataAccessRequest.model_validate(input)
+        except ValidationError as exc:
+            return {
+                "error": "Invalid data_access request.",
+                "details": exc.errors(),
+            }
+        except Exception as exc:  # pragma: no cover - defensive logging
+            return {"error": f"Unexpected validation error: {exc}"}
+
+        entity = request.entity
+        operation = request.operation
+        repository = self.repositories.get(entity)
+
+        if repository is None:
+            return {
+                "error": f"Unknown entity: {entity}.",
+                "valid_entities": list(self.repositories.keys()),
+            }
+
+        try:
+            if operation == "get":
+                return await self._get_by_id(repository, entity, request.id)
+            if operation == "list":
+                return await self._list_entities(repository, request.filters, request.limit)
+            if operation == "search":
+                return await self._search_entities(repository, request.filters, request.limit)
+            return {
+                "error": f"Unknown operation: {operation}.",
+                "valid_operations": ["list", "get", "search"],
+            }
+        except Exception as exc:  # pragma: no cover - repository level errors
+            return {"error": f"Error accessing data: {exc}"}
 
     async def _get_by_id(self, repository, entity: str, entity_id: Any) -> Dict[str, Any]:
         """Retrieve a single entity by ID."""
@@ -200,47 +224,47 @@ class AnalyticsDataTool(ToolBase):
         )
 
     async def run(self, input: Dict[str, Any], context: Dict[str, Any] = None) -> Any:
-        """
-        Execute analytical operations.
-        
-        Args:
-            input: Dictionary containing:
-                - operation: str - The analytical operation to perform
-                - Additional parameters based on the operation
-            context: Optional context dictionary
-            
-        Returns:
-            Analysis results as a dictionary
-        """
+        """Execute validated analytics operations."""
         try:
-            # Parse input if it's a string
             if isinstance(input, str):
                 try:
                     input = json.loads(input)
                 except json.JSONDecodeError:
-                    return {"error": "Invalid JSON input"}
-            
-            operation = input.get('operation', '').lower()
-            
+                    return {"error": "Invalid JSON payload for analytics_data tool."}
+
+            request = AnalyticsRequest.model_validate(input)
+        except ValidationError as exc:
+            return {
+                "error": "Invalid analytics_data request.",
+                "details": exc.errors(),
+            }
+        except Exception as exc:  # pragma: no cover - defensive logging
+            return {"error": f"Unexpected validation error: {exc}"}
+
+        operation = request.operation
+        try:
             if operation == 'product_stats':
-                return await self._get_product_stats(input.get('product_id'))
-            elif operation == 'user_stats':
-                return await self._get_user_stats(input.get('user_id'))
-            elif operation == 'transaction_stats':
-                return await self._get_transaction_stats(input.get('filters', {}))
-            elif operation == 'price_comparison':
-                return await self._get_price_comparison(input.get('product_id'))
-            elif operation == 'supplier_inventory':
-                return await self._get_supplier_inventory(input.get('supplier_id'))
-            else:
-                return {
-                    "error": f"Unknown operation: {operation}. "
-                    f"Valid operations are: 'product_stats', 'user_stats', "
-                    f"'transaction_stats', 'price_comparison', 'supplier_inventory'"
-                }
-                
-        except Exception as e:
-            return {"error": f"Error performing analytics: {str(e)}"}
+                return await self._get_product_stats(request.product_id)
+            if operation == 'user_stats':
+                return await self._get_user_stats(request.user_id)
+            if operation == 'transaction_stats':
+                return await self._get_transaction_stats(request.filters)
+            if operation == 'price_comparison':
+                return await self._get_price_comparison(request.product_id)
+            if operation == 'supplier_inventory':
+                return await self._get_supplier_inventory(request.supplier_id)
+            return {
+                "error": f"Unknown operation: {operation}.",
+                "valid_operations": [
+                    'product_stats',
+                    'user_stats',
+                    'transaction_stats',
+                    'price_comparison',
+                    'supplier_inventory',
+                ],
+            }
+        except Exception as exc:  # pragma: no cover - repository errors
+            return {"error": f"Error performing analytics: {exc}"}
 
     async def _get_product_stats(self, product_id: str) -> Dict[str, Any]:
         """Get statistics for a specific product."""

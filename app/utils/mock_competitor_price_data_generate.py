@@ -106,23 +106,11 @@ def is_in_season(month, in_season_start, in_season_end):
 
 async def insert_mock_competitor_prices():
     """Insert mock competitor prices into the database"""
-    await Tortoise.init(config={
-        "connections": {
-            "default": get_settings().DATABASE_URL
-        },
-        "apps": {
-            "models": {
-                "models": ["app.db.models"],
-                "default_connection": "default"
-            }
-        }
-    })
-    
+    from app.db.repository.competitor_price_repository import CompetitorPriceRepository
     data = await generate_mock_competitor_prices()
     count = 0
-    
     for item in data:
-        await CompetitorPrice.create(
+        await CompetitorPriceRepository.create_competitor_price(
             id=item["id"],
             product_id=item["product_id"],
             tier=CompetitorTier(item["tier"]),
@@ -131,9 +119,7 @@ async def insert_mock_competitor_prices():
             source_location=item["source_location"]
         )
         count += 1
-    
     print(f"Successfully inserted {count} competitor price records")
-    await Tortoise.close_connections()
 
 
 async def print_mock_competitor_prices():

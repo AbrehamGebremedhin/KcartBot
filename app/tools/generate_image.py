@@ -6,22 +6,23 @@ from app.core.config import get_settings
 from app.tools.base import ToolBase
 from typing import Any, Dict
 
-class ImageGenerator(ToolBase):
-	"""
-	Tool to generate images using Gemini API.
-	"""
-	def __init__(self):
+
+class ImageGeneratorTool(ToolBase):
+	"""Generate branded product imagery using Gemini."""
+
+	def __init__(self) -> None:
 		super().__init__(
-			name="ImageGenerator",
-			description="Generates images for fruits, vegetables, and dairy products using the Gemini API."
+			name="image_generator",
+			description="Generate branded produce imagery for marketing collateral using the Gemini API.",
 		)
 
-	async def run(self, subject: str,context: Dict[str, Any] = None) -> str:
+	async def run(self, subject: str, context: Dict[str, Any] = None) -> str:
 		settings = get_settings()
 		client = genai.Client(api_key=settings.gemini_api_key)
 
 		prompt = (
-			f"Generate an image for {subject}, there should only be {subject} in the frame. The {subject} should be shown as packed and fresh on the package add a tag KCartBot in bold and powered by ChipChip"
+			f"Generate an image for {subject}, there should only be {subject} in the frame. "
+			f"The {subject} should be shown as packed and fresh on the package add a tag KCartBot in bold and powered by ChipChip"
 		)
 
 		response = client.models.generate_content(

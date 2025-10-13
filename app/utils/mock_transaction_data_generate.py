@@ -265,24 +265,12 @@ async def generate_mock_transactions_and_orders():
 
 async def insert_mock_transactions_and_orders():
     """Insert mock transactions and order items into the database"""
-    await Tortoise.init(config={
-        "connections": {
-            "default": get_settings().DATABASE_URL
-        },
-        "apps": {
-            "models": {
-                "models": ["app.db.models"],
-                "default_connection": "default"
-            }
-        }
-    })
-    
+    from app.db.repository.transaction_repository import TransactionRepository
+    from app.db.repository.order_item_repository import OrderItemRepository
     transactions, order_items = await generate_mock_transactions_and_orders()
-    
-    # Insert transactions
     transaction_count = 0
     for item in transactions:
-        await Transaction.create(
+        await TransactionRepository.create_transaction(
             order_id=item["order_id"],
             user_id=item["user_id"],
             date=item["date"],
@@ -292,13 +280,10 @@ async def insert_mock_transactions_and_orders():
             status=TransactionStatus(item["status"])
         )
         transaction_count += 1
-    
     print(f"\nSuccessfully inserted {transaction_count} transactions")
-    
-    # Insert order items
     order_item_count = 0
     for item in order_items:
-        await OrderItem.create(
+        await OrderItemRepository.create_order_item(
             id=item["id"],
             order_id=item["order_id"],
             product_id=item["product_id"],
@@ -309,10 +294,7 @@ async def insert_mock_transactions_and_orders():
             subtotal=item["subtotal"]
         )
         order_item_count += 1
-    
     print(f"Successfully inserted {order_item_count} order items")
-    
-    await Tortoise.close_connections()
 
 
 async def print_mock_transactions_and_orders():

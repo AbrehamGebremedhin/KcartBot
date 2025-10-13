@@ -125,11 +125,13 @@ class Transaction(models.Model):
 	class Meta:
 		table = "transactions"
 
+
+# Restore OrderItem Model
 class OrderItem(models.Model):
 	id = fields.UUIDField(pk=True)
 	order = fields.ForeignKeyField("models.Transaction", related_name="order_items")
 	product = fields.ForeignKeyField("models.Product", related_name="order_items")
-	supplier = fields.ForeignKeyField("models.User", related_name="order_items")
+	supplier = fields.ForeignKeyField("models.User", related_name="order_items", null=True)
 	quantity = fields.FloatField()
 	unit = fields.CharEnumField(enum_type=UnitType)
 	price_per_unit = fields.FloatField()
@@ -137,3 +139,28 @@ class OrderItem(models.Model):
 
 	class Meta:
 		table = "order_items"
+
+# FlashSaleStatus Enum
+class FlashSaleStatus(str, Enum):
+	PROPOSED = "proposed"
+	SCHEDULED = "scheduled"
+	ACTIVE = "active"
+	EXPIRED = "expired"
+	CANCELLED = "cancelled"
+
+# FlashSale Model
+class FlashSale(models.Model):
+	id = fields.IntField(pk=True)
+	supplier_product = fields.ForeignKeyField("models.SupplierProduct", related_name="flash_sales", null=True)
+	supplier = fields.ForeignKeyField("models.User", related_name="flash_sales")
+	product = fields.ForeignKeyField("models.Product", related_name="flash_sales")
+	start_date = fields.DatetimeField()
+	end_date = fields.DatetimeField()
+	discount_percent = fields.FloatField()
+	status = fields.CharEnumField(enum_type=FlashSaleStatus)
+	auto_generated = fields.BooleanField(default=False)
+	created_at = fields.DatetimeField(auto_now_add=True)
+	updated_at = fields.DatetimeField(auto_now=True)
+
+	class Meta:
+		table = "flash_sales"

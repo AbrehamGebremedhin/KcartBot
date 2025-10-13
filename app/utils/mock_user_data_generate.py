@@ -93,22 +93,11 @@ def generate_mock_users(num_customers=30, num_suppliers=15):
 
 async def insert_mock_users():
     """Insert mock users into the database"""
-    await Tortoise.init(config={
-        "connections": {
-            "default": get_settings().DATABASE_URL
-        },
-        "apps": {
-            "models": {
-                "models": ["app.db.models"],
-                "default_connection": "default"
-            }
-        }
-    })
-    
+    from app.db.repository.user_repository import UserRepository
     data = generate_mock_users()
     count = 0
     for item in data:
-        await User.create(
+        await UserRepository.create_user(
             name=item["name"],
             phone=item["phone"],
             default_location=item["default_location"],
@@ -117,9 +106,7 @@ async def insert_mock_users():
             joined_date=item["joined_date"]
         )
         count += 1
-    
     print(f"Successfully inserted {count} users ({sum(1 for u in data if u['role'] == 'customer')} customers, {sum(1 for u in data if u['role'] == 'supplier')} suppliers)")
-    await Tortoise.close_connections()
 
 
 def print_mock_users():
