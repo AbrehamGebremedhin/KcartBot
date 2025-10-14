@@ -255,7 +255,10 @@ class ChatService:
 	async def _match_user(self, state: SessionState):
 		filters: Dict[str, Any] = {}
 		if state.name:
-			filters["name"] = state.name
+			filters["name"] = {
+				"lookup": "iexact",
+				"value": state.name.strip(),
+			}
 		if state.phone:
 			filters["phone"] = state.phone
 		if state.user_role:

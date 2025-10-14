@@ -158,8 +158,22 @@ class PDFDataLoader:
             List of text chunks
         """
         try:
-            chunks = self.text_splitter.split_text(text)
-            logger.info(f"Split text into {len(chunks)} chunks")
+            raw_chunks = self.text_splitter.split_text(text)
+
+            # Normalise whitespace-heavy chunks so we don't store empty records downstream
+            chunks: List[str] = []
+            for idx, chunk in enumerate(raw_chunks):
+                normalised = chunk.strip()
+                if not normalised:
+                    logger.debug("Skipping empty chunk at index %s", idx)
+                    continue
+                chunks.append(normalised)
+
+            logger.info(
+                "Split text into %s non-empty chunks (raw produced %s)",
+                len(chunks),
+                len(raw_chunks),
+            )
             return chunks
         except Exception as e:
             logger.error(f"Failed to split text: {str(e)}")
@@ -318,6 +332,18 @@ class PDFDataLoader:
             # Verify embedding dimension
             embedding_dim = len(embeddings[0]) if embeddings else 768
             logger.info(f"Embedding dimension: {embedding_dim}")
+
+            if len(chunks) != len(embeddings):
+                raise ValueError(
+                    "Mismatch between chunk count and embedding count: "
+                    f"{len(chunks)} chunks vs {len(embeddings)} embeddings"
+                )
+
+            if not chunks:
+                raise ValueError(
+                    "No textual content extracted from the PDF. "
+                    "Check that the document contains selectable text or rerun with overwrite=True after updating the source."
+                )
             
             # Step 4: Setup Milvus collection
             logger.info("Step 4: Setting up Milvus collection...")
@@ -332,17 +358,15 @@ class PDFDataLoader:
             logger.info("Step 5: Preparing data for Milvus insertion...")
             source_path = str(Path(pdf_path).name)
             
-            # Prepare data as list of entities
-            entities = []
+            entities: List[Dict[str, Any]] = []
             for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-                entity = {
+                entities.append({
                     "id": self.generate_chunk_id(chunk, idx),
                     "embedding": embedding,
                     "text": chunk,
                     "source": source_path,
                     "chunk_index": idx,
-                }
-                entities.append(entity)
+                })
             
             # Step 6: Insert into Milvus
             logger.info("Step 6: Inserting data into Milvus...")
@@ -393,9 +417,7 @@ class PDFDataLoader:
         Returns:
             List of search results with text and metadata
         """
-        try:
-            await self.milvus.connect()
-            
+        try:           
             # Generate embedding for query
             result = self.client.models.embed_content(
                 model=self.embedding_model,
@@ -457,6 +479,21 @@ async def load_context_pdf(
 
 
 # Example usage
+async def delete_collection(collection_name: str = "KCartBot") -> None:
+    """Convenience helper to remove a Milvus collection via the data loader."""
+    loader = PDFDataLoader(collection_name=collection_name)
+    try:
+        await loader.milvus.connect()
+        if loader.milvus.collection_exists(collection_name):
+            await loader.milvus.drop_collection(collection_name)
+            logger.info("Dropped Milvus collection '%s'", collection_name)
+        else:
+            logger.info("Collection '%s' does not exist; nothing to delete", collection_name)
+    finally:
+        if loader.milvus.is_connected():
+            loader.milvus.disconnect()
+
+
 if __name__ == "__main__":
     import asyncio
     
@@ -466,6 +503,7 @@ if __name__ == "__main__":
     )
     
     async def main():
+        await delete_collection("KCartBot")  # Uncomment to reset collection
         # Load the context.pdf file
         stats = await load_context_pdf(
             pdf_path="data/context.pdf",

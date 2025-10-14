@@ -45,16 +45,20 @@ You are the orchestration layer for KCartBot. Coordinate between customers and s
 2. Using conversation history to understand context - if user says "okay", "yes", "sure" etc., treat it as confirmation of the previous assistant message.
 3. Choosing downstream tools (`vector_search`, `data_access`, `analytics_data`, `flash_sale_manager`, `image_generator`) based on the intent outcome.
 4. Synthesising concise, friendly replies (1-3 sentences) that confirm critical information.
+5. Format every reply as a single line with no newline characters; join sentences into one paragraph.
 
 Guidelines:
 - Customer flow: support onboarding, advisory (using retrieved context), ordering, logistics, and payment confirmation.
-- Supplier flow: support onboarding, inventory management, scheduling, pricing insights, flash sale decisions, and imagery.
+- Supplier flow: support onboarding, inventory management, scheduling, pricing insights, flash sale decisions, handling/storage guidance, and imagery.
 - During supplier inventory intake, gather product name, quantity, price per unit, expiry date, and available delivery days. Infer category when obvious (e.g., tomatoes → vegetable) instead of asking the user to supply it explicitly. If expiry date or delivery schedule is missing, ask for it explicitly, accepting natural phrases like "all week", "weekends", or "next week" and convert them to specific availability before calling tools.
  - During supplier inventory intake, gather product name, quantity, price per unit, expiry date, and available delivery days. Ask for one missing detail at a time (e.g., request the expiry date, wait for the reply, then ask about delivery days). Infer category when obvious (e.g., tomatoes → vegetable) instead of asking the user to supply it explicitly. If expiry date or delivery schedule is missing, ask for it explicitly, accepting natural phrases like "all week", "weekends", or "next week" and convert them to specific availability before calling tools. When a schedule or expiry phrase is resolved, reuse that observation instead of re-calling `schedule_helper`.
 - Currency handling: the marketplace operates in Ethiopian Birr (ETB). Present all monetary amounts in ETB, treat user mentions of other currencies as informational only, and ask for or perform ETB conversion rather than switching currencies.
 - Units: Solid goods are tracked per kilogram (kg) and liquids per liter (liter). Keep conversations and inventory updates in those units unless converting between them for clarity.
+- Language support: Detect and comfortably engage in English, Amharic (Ge'ez script), and phonetic Amharic (Latin script). Default to English responses unless the user's latest message is entirely Amharic or phonetic Amharic, in which case reply in Amharic (optionally adding a concise English gloss if it aids clarity). Confirm before switching languages mid-conversation.
+- Product name handling: Catalog entries carry English, Amharic, and phonetic Amharic variants. When matching user inputs (including minor spelling mistakes) to products or quoting names back, search across all variants, normalise simple misspellings, and respond using the language variant that matches the conversation.
 - Treat structured data as primary: for pricing, inventory, sales history, or comparisons, call `data_access` or `analytics_data` first (e.g. fetch competitor prices for "best price" style questions). Only fall back to `vector_search` if the answer clearly depends on documentation or knowledge base snippets.
 - Use `vector_search` for documentation or policy lookups when structured data is insufficient.
+- When a supplier asks how to store, preserve, or handle a product, respond with storage guidance drawn from retrieved context or well-known best practices unless they explicitly request stock levels or status updates.
 - When a tool returns a valid result, incorporate it into the reply rather than calling the same tool repeatedly unless new parameters are supplied.
 - Call `intent_classifier` exactly once per user turn; reuse its output for the remainder of the turn. If the classifier reports missing slots (e.g. `product_name`), ask the user to provide them instead of re-calling the classifier.
 - When planning pricing insights, always include a concrete `product_name` (or `product_id`) for analytics calls. Reuse the exact spelling from inventory records when known, and normalise simple plural/singular variants (e.g. "tomatoes" → "Tomato"). If no product is specified, consult the supplier's inventory or ask the user to choose one before calling pricing tools.
@@ -534,6 +538,39 @@ class KcartAgent:
 				return filters.get(filter_key)
 		return None
 
+	@staticmethod
+	def _normalise_unit_label(unit: Any) -> str:
+		if not unit:
+			return ""
+		label = str(unit).strip()
+		if not label:
+			return ""
+		if label.lower().startswith("unittype."):
+			label = label.split(".", 1)[-1]
+		label = label.replace("_", " ").strip()
+		return label.lower()
+
+	@staticmethod
+	def _find_listing_by_inventory_id(
+		tool_calls: Sequence[Dict[str, Any]],
+		inventory_id: Optional[str],
+	) -> Optional[Dict[str, Any]]:
+		if not inventory_id:
+			return None
+		for call in reversed(tool_calls):
+			if call.get("tool") != "data_access":
+				continue
+			observation = call.get("observation")
+			if not isinstance(observation, dict):
+				continue
+			results = observation.get("results")
+			if not isinstance(results, list):
+				continue
+			for entry in results:
+				if isinstance(entry, dict) and str(entry.get("inventory_id")) == str(inventory_id):
+					return entry
+		return None
+
 	def _build_pricing_guidance_fallback(
 		self,
 		tool_calls: List[Dict[str, Any]],
@@ -628,7 +665,7 @@ class KcartAgent:
 		self,
 		tool_calls: List[Dict[str, Any]],
 	) -> Optional[str]:
-		listing: Optional[Dict[str, Any]] = None
+		listings: List[Dict[str, Any]] = []
 		for call in reversed(tool_calls):
 			if call.get("tool") != "data_access":
 				continue
@@ -636,60 +673,128 @@ class KcartAgent:
 			if not isinstance(observation, dict):
 				continue
 			results = observation.get("results")
-			if isinstance(results, list) and results:
-				first_entry = results[0]
-				if isinstance(first_entry, dict):
-					listing = first_entry
-					break
-		if not isinstance(listing, dict):
+			if not isinstance(results, list):
+				continue
+			for entry in results:
+				if isinstance(entry, dict):
+					listings.append(entry)
+			if listings:
+				break
+		if not listings:
 			return None
 
-		quantity = listing.get("quantity_available")
-		if quantity is None:
-			return None
-		unit_raw = str(listing.get("unit") or "").strip()
-		unit_label = unit_raw
-		if unit_label.lower().startswith("unittype."):
-			unit_label = unit_label.split(".", 1)[-1].lower()
-		if unit_label and unit_label.isupper():
-			unit_label = unit_label.lower()
-		if unit_label:
-			unit_label = unit_label.lower()
-		unit_phrase = f" {unit_label}" if unit_label else ""
-		quantity_display = self._format_decimal(quantity) or str(quantity)
+		formatted_entries: List[str] = []
+		for entry in listings:
+			quantity = entry.get("quantity_available")
+			if quantity is None:
+				continue
+			quantity_display = self._format_decimal(quantity) or str(quantity)
+			unit_label = self._normalise_unit_label(entry.get("unit"))
+			unit_phrase = f" {unit_label}" if unit_label else ""
+			product_label = entry.get("product_name")
+			if not product_label:
+				product_label = self._extract_product_name(tool_calls, entry.get("product_id"))
+			if not product_label:
+				product_label = self._extract_filter_value(tool_calls, "product_name")
+			label = str(product_label) if product_label else "Unnamed product"
 
-		product_label = listing.get("product_name")
-		if not product_label:
-			product_id = listing.get("product_id")
-			product_label = self._extract_product_name(tool_calls, product_id)
-		if not product_label:
-			product_label = self._extract_filter_value(tool_calls, "product_name")
-		label = str(product_label) if product_label else "that product"
+			unit_price = self._extract_supplier_price(entry)
+			unit_price_display = self._format_decimal(unit_price)
+			per_clause = f" per {unit_label}" if unit_label else ""
+			price_clause = ""
+			if unit_price_display:
+				price_clause = f" at {unit_price_display} ETB{per_clause}"
 
-		unit_price = self._extract_supplier_price(listing)
-		unit_price_display = self._format_decimal(unit_price)
-		currency = "ETB"
-		price_clause = ""
-		if unit_price_display:
-			if unit_label:
-				price_clause = f" at {unit_price_display} {currency} per {unit_label}"
+			status_bits: List[str] = []
+			if entry.get("is_expired"):
+				status_bits.append("expired")
 			else:
-				price_clause = f" at {unit_price_display} {currency}"
+				effective_status = str(entry.get("effective_status") or entry.get("status") or "").strip()
+				if effective_status and effective_status.lower() not in {"", "active"}:
+					status_bits.append(effective_status.replace("_", " ").lower())
+			expiry_date = entry.get("expiry_date")
+			if expiry_date:
+				status_bits.append(f"expiry {expiry_date}")
+			status_suffix = f" ({', '.join(status_bits)})" if status_bits else ""
 
-		status_note = ""
-		if listing.get("is_expired"):
-			status_note = " This lot is expired."
-		else:
-			effective_status = str(listing.get("effective_status") or listing.get("status") or "").strip()
-			if effective_status and effective_status.lower() not in {"", "active"}:
-				status_note = f" This lot is currently marked {effective_status.replace('_', ' ')}."
+			formatted_entries.append(
+				f"{label}: {quantity_display}{unit_phrase}{price_clause}{status_suffix}"
+			)
 
-		message = (
-			f"You currently have {quantity_display}{unit_phrase} of {label} in inventory{price_clause}."
-		)
-		message += status_note or ""
-		message += " Need any help adjusting the stock or price?"
-		return message
+		if not formatted_entries:
+			return None
+
+		visible_entries = formatted_entries[:5]
+		remaining = len(formatted_entries) - len(visible_entries)
+		summary = "; ".join(visible_entries)
+		if remaining > 0:
+			remainder_phrase = f"; and {remaining} more item{'s' if remaining != 1 else ''}"
+			summary += remainder_phrase
+
+		return f"Inventory snapshot: {summary}. Need any help adjusting stock or prices?"
+
+	def _build_inventory_deletion_confirmation(
+		self,
+		tool_calls: List[Dict[str, Any]],
+	) -> Optional[str]:
+		for call in reversed(tool_calls):
+			if call.get("tool") != "data_access":
+				continue
+			observation = call.get("observation")
+			message: Optional[str] = None
+			if isinstance(observation, dict):
+				message = observation.get("message")
+			elif isinstance(observation, str):
+				message = observation
+			if not message or "deleted" not in message.lower():
+				continue
+			parsed_input = self._parse_tool_input(call.get("input"))
+			inventory_id: Optional[str] = None
+			product_hint: Optional[str] = None
+			if isinstance(parsed_input, dict):
+				inventory_id = parsed_input.get("id") or parsed_input.get("inventory_id")
+				filters = parsed_input.get("filters")
+				if isinstance(filters, dict):
+					inventory_id = inventory_id or filters.get("inventory_id")
+					product_hint = filters.get("product_name") or filters.get("name")
+			listing = self._find_listing_by_inventory_id(tool_calls, inventory_id)
+			label = None
+			if isinstance(listing, dict):
+				label = listing.get("product_name") or listing.get("name")
+			if not label:
+				label = product_hint or "that item"
+			quantity_display = None
+			unit_phrase = ""
+			price_clause = ""
+			status_bits: List[str] = []
+			expiry_note = None
+			if isinstance(listing, dict):
+				quantity_display = self._format_decimal(listing.get("quantity_available"))
+				if not quantity_display and listing.get("quantity_available") is not None:
+					quantity_display = str(listing.get("quantity_available"))
+				unit_label = self._normalise_unit_label(listing.get("unit"))
+				if unit_label:
+					unit_phrase = f" {unit_label}"
+				unit_price = self._extract_supplier_price(listing)
+				unit_price_display = self._format_decimal(unit_price)
+				if unit_price_display:
+					per_clause = f" per {unit_label}" if unit_label else ""
+					price_clause = f" at {unit_price_display} ETB{per_clause}"
+				if listing.get("is_expired"):
+					status_bits.append("expired")
+				else:
+					effective_status = str(listing.get("effective_status") or listing.get("status") or "").strip()
+					if effective_status and effective_status.lower() not in {"", "active"}:
+						status_bits.append(effective_status.replace("_", " ").lower())
+				expiry_note = listing.get("expiry_date")
+			if expiry_note:
+				status_bits.append(f"expiry {expiry_note}")
+			status_suffix = f" ({', '.join(status_bits)})" if status_bits else ""
+			quantity_clause = f" {quantity_display}{unit_phrase}" if quantity_display else ""
+			return (
+				f"Removed {label}{quantity_clause}{price_clause}{status_suffix}. Anything else to update?"
+			)
+		return None
 
 	def _build_schedule_followup(
 		self,
@@ -720,17 +825,44 @@ class KcartAgent:
 			return f"I'll record the expiry date as {pretty}. Could you share your delivery schedule?"
 		return None
 
-	def _build_fallback_reply(self, tool_calls: List[Dict[str, Any]]) -> Optional[str]:
-		builders = (
-			self._build_schedule_followup,
-			self._build_pricing_guidance_fallback,
-			self._build_inventory_fallback,
+	@staticmethod
+	def _is_storage_question(user_input: Optional[str]) -> bool:
+		if not user_input:
+			return False
+		lowered = user_input.lower()
+		storage_markers = (
+			" store",
+			" storage",
+			" keep",
+			" keeping",
+			" preserve",
+			"ታከማ",
+			"ማከማ",
 		)
-		for builder in builders:
-			text = builder(tool_calls)
-			if text:
-				return text
-		return None
+		return any(marker in lowered for marker in storage_markers)
+
+	def _build_fallback_reply(
+		self,
+		tool_calls: List[Dict[str, Any]],
+		user_input: Optional[str],
+		classifier_output: Optional[Dict[str, Any]],
+	) -> Optional[str]:
+		text = self._build_schedule_followup(tool_calls)
+		if text:
+			return text
+
+		text = self._build_pricing_guidance_fallback(tool_calls)
+		if text:
+			return text
+
+		text = self._build_inventory_deletion_confirmation(tool_calls)
+		if text:
+			return text
+
+		if self._is_storage_question(user_input):
+			return None
+
+		return self._build_inventory_fallback(tool_calls)
 
 	async def aclose(self) -> None:
 		for adapter in self._tool_adapters:
@@ -773,7 +905,7 @@ class KcartAgent:
 		response_text = result.get("output") or ""
 		fallback_reply = None
 		if response_text.strip() in {"", "Agent stopped due to iteration limit or time limit."}:
-			fallback_reply = self._build_fallback_reply(tool_calls)
+			fallback_reply = self._build_fallback_reply(tool_calls, user_input, classifier_output)
 		if fallback_reply:
 			response_text = fallback_reply
 		elif not response_text:

@@ -1,7 +1,6 @@
 from typing import Any, Dict, List, Optional
 import json
 import asyncio
-import re
 from datetime import datetime, timedelta, date
 from decimal import Decimal
 from uuid import UUID
@@ -321,6 +320,9 @@ class DataAccessTool(ToolBase):
             if product is not None:
                 data.setdefault("product_id", getattr(model, "product_id", None))
                 data["product_name"] = getattr(product, "product_name_en", None)
+                data["product_name_en"] = getattr(product, "product_name_en", None)
+                data["product_name_am"] = getattr(product, "product_name_am", None)
+                data["product_name_am_latin"] = getattr(product, "product_name_am_latin", None)
                 category = getattr(product, "category", None)
                 data["product_category"] = getattr(category, "value", category)
             expiry_date = getattr(model, "expiry_date", None)
@@ -1289,79 +1291,17 @@ class AnalyticsDataTool(ToolBase):
             if product:
                 return product
 
-        for candidate in self._generate_product_name_candidates(product_name):
-            product = await ProductRepository.get_product_by_name(candidate)
-            if product:
-                return product
+        resolved = await ProductRepository.find_product_by_any_name(product_name)
+        if resolved:
+            return resolved
 
-        for candidate in self._generate_product_name_candidates(product_name):
-            filters = {
-                'product_name_en': {
-                    'lookup': 'icontains',
-                    'value': candidate,
-                }
-            }
-            matches = await ProductRepository.list_products(filters)
-            if matches:
-                return matches[0]
         return None
-
-    @staticmethod
-    def _generate_product_name_candidates(name: Optional[str]) -> List[str]:
-        if not name:
-            return []
-        raw = name.strip()
-        if not raw:
-            return []
-
-        variants: List[str] = []
-        def _append(value: Optional[str]) -> None:
-            if value and value not in variants:
-                variants.append(value)
-
-        lower = raw.lower()
-        cleaned_tokens = re.findall(r"[a-z0-9]+", lower)
-        cleaned = " ".join(cleaned_tokens)
-
-        _append(raw)
-        _append(lower)
-        _append(cleaned)
-        _append(AnalyticsDataTool._singularize_phrase(raw))
-        _append(AnalyticsDataTool._singularize_phrase(lower))
-        _append(AnalyticsDataTool._singularize_phrase(cleaned))
-
-        return [variant for variant in variants if variant]
-
-    @staticmethod
-    def _singularize_phrase(phrase: Optional[str]) -> str:
-        if not phrase:
-            return ""
-        words = phrase.split()
-        if not words:
-            return phrase
-        words[-1] = AnalyticsDataTool._singularize_word(words[-1])
-        return " ".join(words)
 
     @staticmethod
     def _format_competitor_tier_label(tier_value: str) -> str:
         if not tier_value:
             return ""
         return tier_value.replace("_", " ").title()
-
-    @staticmethod
-    def _singularize_word(word: str) -> str:
-        lower = word.lower()
-        if lower.endswith("ies") and len(lower) > 3:
-            return lower[:-3] + "y"
-        if lower.endswith("oes") and len(lower) > 3:
-            return lower[:-2]
-        if lower.endswith("ses") and len(lower) > 3:
-            return lower[:-2]
-        if lower.endswith("ves") and len(lower) > 3:
-            return lower[:-3] + "f"
-        if lower.endswith("s") and len(lower) > 2:
-            return lower[:-1]
-        return lower
 
     async def _get_supplier_inventory(self, supplier_id: Optional[int], supplier_name: Optional[str]) -> Dict[str, Any]:
         """Get inventory details for a specific supplier."""
@@ -1405,7 +1345,9 @@ class AnalyticsDataTool(ToolBase):
         inventory_items = []
         for sp in supplier_products:
             product = getattr(sp, "product", None)
-            product_name = getattr(product, "product_name_en", None) if product else None
+            product_name_en = getattr(product, "product_name_en", None) if product else None
+            product_name_am = getattr(product, "product_name_am", None) if product else None
+            product_name_am_latin = getattr(product, "product_name_am_latin", None) if product else None
             category = getattr(product, "category", None)
             expiry_date = sp.expiry_date
             is_expired = bool(expiry_date and expiry_date < current_date)
@@ -1416,7 +1358,10 @@ class AnalyticsDataTool(ToolBase):
                 {
                     "inventory_id": str(sp.inventory_id),
                     "product_id": str(sp.product_id),
-                    "product_name": product_name,
+                    "product_name": product_name_en,
+                    "product_name_en": product_name_en,
+                    "product_name_am": product_name_am,
+                    "product_name_am_latin": product_name_am_latin,
                     "product_category": getattr(category, "value", category),
                     "quantity_available": sp.quantity_available,
                     "unit": sp.unit.value,

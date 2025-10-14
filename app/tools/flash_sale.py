@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -38,7 +39,12 @@ class FlashSaleTool(ToolBase):
             ),
         )
 
-    async def run(self, input: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def run(self, input: Any, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if isinstance(input, str):
+            try:
+                input = json.loads(input)
+            except json.JSONDecodeError:
+                return {"error": "Invalid flash sale payload", "details": "Input must be JSON when supplied as text."}
         try:
             payload = FlashSaleToolPayload.model_validate(input)
         except ValidationError as exc:

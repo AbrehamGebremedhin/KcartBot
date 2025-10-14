@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 import asyncio
 import json
 import logging
+from datetime import datetime, timedelta
 
 from app.tools.base import ToolBase
 from app.db.milvus_handler import MilvusHandler
@@ -12,6 +13,15 @@ from app.core.config import get_settings
 from google import genai
 
 logger = logging.getLogger(__name__)
+
+
+class VectorDBUnavailableError(RuntimeError):
+    """Raised when the vector database cannot be reached."""
+
+    def __init__(self, message: str, *, details: Optional[str] = None, retry_after: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.details = details
+        self.retry_after = retry_after
 
 
 class VectorSearchTool(ToolBase):
@@ -70,30 +80,78 @@ class VectorSearchTool(ToolBase):
         
         # Connection state tracking
         self._connected = False
+        self._connection_failure: Optional[Dict[str, Any]] = None
+        self._next_retry_at: Optional[datetime] = None
         
         logger.info(f"VectorSearchTool initialized with collection '{collection_name}'")
 
     async def _ensure_connection(self) -> None:
         """Ensure Milvus connection is active."""
-        if not self._connected or not self.milvus.is_connected():
-            await self.milvus.connect()
-            self._connected = True
-            
-            # Verify collection exists
-            if not self.milvus.collection_exists(self.collection_name):
-                logger.warning(
-                    f"Collection '{self.collection_name}' does not exist. "
-                    "Please load data using the dataloader utility first."
-                )
-                raise ValueError(
-                    f"Vector database collection '{self.collection_name}' not found. "
-                    "Please ensure the knowledge base has been loaded."
-                )
-            
-            # Load collection into memory for searching
-            if not self.milvus.is_collection_loaded(self.collection_name):
-                await self.milvus.load_collection(self.collection_name)
-                logger.info(f"Loaded collection '{self.collection_name}' into memory")
+        now = datetime.utcnow()
+
+        if self._connection_failure and self._next_retry_at and now < self._next_retry_at:
+            remaining = self._retry_delay_seconds(now)
+            message = self._connection_failure.get(
+                "message",
+                "Vector database is currently unavailable."
+            )
+            raise VectorDBUnavailableError(
+                message,
+                details=self._connection_failure.get("details"),
+                retry_after=remaining,
+            )
+
+        try:
+            if not self._connected or not self.milvus.is_connected():
+                await self.milvus.connect()
+                self._connected = True
+                self._connection_failure = None
+                self._next_retry_at = None
+
+                # Verify collection exists
+                if not self.milvus.collection_exists(self.collection_name):
+                    logger.warning(
+                        f"Collection '{self.collection_name}' does not exist. "
+                        "Please load data using the dataloader utility first."
+                    )
+                    raise ValueError(
+                        f"Vector database collection '{self.collection_name}' not found. "
+                        "Please ensure the knowledge base has been loaded."
+                    )
+
+                # Load collection into memory for searching
+                if not self.milvus.is_collection_loaded(self.collection_name):
+                    await self.milvus.load_collection(self.collection_name)
+                    logger.info(f"Loaded collection '{self.collection_name}' into memory")
+        except Exception as exc:  # pragma: no cover - defensive connection handling
+            self._connected = False
+            self._connection_failure = {
+                "message": (
+                    "Vector database connection failed. Milvus may be offline or unreachable "
+                    f"at {self.milvus.host}:{self.milvus.port}."
+                ),
+                "details": str(exc),
+                "timestamp": now,
+            }
+            self._next_retry_at = now + timedelta(minutes=5)
+            retry_after = self._retry_delay_seconds(now)
+            logger.warning(
+                "Vector search connection failure (retry in %s seconds): %s",
+                retry_after,
+                exc,
+            )
+            raise VectorDBUnavailableError(
+                self._connection_failure["message"],
+                details=str(exc),
+                retry_after=retry_after,
+            ) from exc
+
+    def _retry_delay_seconds(self, now: Optional[datetime] = None) -> Optional[int]:
+        if self._next_retry_at is None:
+            return None
+        now = now or datetime.utcnow()
+        delta = self._next_retry_at - now
+        return max(int(delta.total_seconds()), 0)
 
     def _generate_query_embedding(self, query_text: str) -> List[float]:
         """
@@ -151,24 +209,61 @@ class VectorSearchTool(ToolBase):
             
             # Format and filter results
             formatted_results = []
-            for hit in results[0]:  # results[0] because we only have one query vector
+            hits_for_query = results[0] if results else []
+            for hit in hits_for_query:  # results[0] because we only have one query vector
+                # Normalise milvus hit into a plain dictionary
+                if isinstance(hit, dict):
+                    distance = hit.get("distance")
+                    entity = hit.get("entity") or {}
+                    raw_score = hit.get("score")
+                else:
+                    distance = getattr(hit, "distance", None)
+                    raw_score = getattr(hit, "score", None)
+                    entity = getattr(hit, "entity", None)
+                    if hasattr(entity, "to_dict"):
+                        entity = entity.to_dict()
+                    elif not isinstance(entity, dict):
+                        entity = {}
+
+                if distance is None:
+                    logger.debug("Skipping hit without distance: %s", hit)
+                    continue
+
                 # Convert distance to similarity score (Cosine: 1 - distance)
                 # Milvus returns distance, we want similarity (0-1 scale)
-                similarity_score = 1 - hit.distance if hit.distance <= 1 else 0
-                
+                similarity_score = 1 - distance if distance <= 1 else max(0.0, 1 - distance)
+
                 # Apply minimum score threshold if specified
                 if min_score is not None and similarity_score < min_score:
                     continue
-                
+
+                text_value = ""
+                source_value = "unknown"
+                chunk_index_value = -1
+
+                if isinstance(entity, dict):
+                    text_value = entity.get("text", "")
+                    source_value = entity.get("source", "unknown")
+                    chunk_index_value = entity.get("chunk_index", -1)
+                elif isinstance(hit, dict):
+                    text_value = hit.get("text", "")
+                    source_value = hit.get("source", "unknown")
+                    chunk_index_value = hit.get("chunk_index", -1)
+
                 formatted_results.append({
-                    "text": hit.entity.get("text", ""),
-                    "source": hit.entity.get("source", "unknown"),
-                    "chunk_index": hit.entity.get("chunk_index", -1),
+                    "text": text_value,
+                    "source": source_value,
+                    "chunk_index": chunk_index_value,
                     "score": round(similarity_score, 4),
-                    "distance": round(hit.distance, 4),
+                    "distance": round(distance, 4),
+                    "raw_score": raw_score,
                 })
             
-            logger.info(f"Found {len(formatted_results)} results (from {len(results[0])} total)")
+            logger.info(
+                "Found %s results (from %s total)",
+                len(formatted_results),
+                len(hits_for_query),
+            )
             return formatted_results
             
         except Exception as e:
@@ -197,6 +292,7 @@ class VectorSearchTool(ToolBase):
             - count: Number of results returned
             - metadata: Search parameters used
         """
+        query: Optional[str] = None
         try:
             # Parse input if it's a string
             if isinstance(input, str):
@@ -273,7 +369,24 @@ class VectorSearchTool(ToolBase):
                 response["context_summary"] = self._create_context_summary(search_results)
             
             return response
-            
+        except VectorDBUnavailableError as exc:
+            retry_after = exc.retry_after
+            details: Dict[str, Any] = {
+                "host": getattr(self.milvus, "host", "localhost"),
+                "port": getattr(self.milvus, "port", "19530"),
+            }
+            if exc.details:
+                details["last_error"] = exc.details
+            if retry_after is not None:
+                details["retry_after_seconds"] = retry_after
+
+            logger.info("Vector DB unavailable: %s", exc.details or exc)
+            return {
+                "error": "vector_db_unavailable",
+                "message": str(exc),
+                "query": query,
+                "details": details,
+            }
         except Exception as e:
             logger.error(f"Vector search tool error: {str(e)}")
             return {
