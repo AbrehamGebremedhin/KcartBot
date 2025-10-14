@@ -1,10 +1,14 @@
-from app.db.models import OrderItem
+from typing import Optional
+
+from tortoise.backends.base.client import BaseDBAsyncClient
 from tortoise.exceptions import DoesNotExist
+
+from app.db.models import OrderItem
 
 class OrderItemRepository:
     @staticmethod
-    async def create_order_item(**kwargs):
-        return await OrderItem.create(**kwargs)
+    async def create_order_item(*, using_db: Optional[BaseDBAsyncClient] = None, **kwargs):
+        return await OrderItem.create(using_db=using_db, **kwargs)
 
     @staticmethod
     async def get_order_item_by_id(id):

@@ -5,7 +5,8 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, AsyncIterator, Iterable, List, Mapping, Optional
+from time import perf_counter
+from typing import Any, AsyncGenerator, AsyncIterator, Dict, Iterable, List, Mapping, Optional
 
 import httpx
 
@@ -18,6 +19,10 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+class LLMServiceError(RuntimeError):
+    """Raised when the upstream language model request definitively fails."""
+
+
 @dataclass
 class LLMConfig:
     """Configuration for AsyncLLMService."""
@@ -27,6 +32,8 @@ class LLMConfig:
     retry_backoff: float = 0.5  # seconds
     api_key: Optional[str] = None
     base_url: str = "https://api.deepseek.com/v1"
+    request_timeout: float = 45.0  # seconds
+    slow_request_threshold: float = 8.0  # seconds
     extra_kwargs: Mapping[str, object] = field(default_factory=dict)
 
 
@@ -42,143 +49,13 @@ class LLMService:
         self.config = config or LLMConfig()
         self.system_prompt = system_prompt or (
             """
-            You are KCartBot, a conversational marketplace platform connecting customers with suppliers of fresh produce and groceries.
-
-            ## Core Identity
-            - **Name**: KCartBot
-            - **Role**: Handle ALL interactions for customers and suppliers
-            - **Tone**: Warm, helpful, efficient, knowledgeable about fresh produce
-            - **Style**: Natural conversation, 1-3 sentences per response, avoid robotic language
-
-            ## Critical Rules
-            1. **Detect User Type First**: Determine if CUSTOMER or SUPPLIER in first interaction
-            2. **Context Aware**: Remember conversation history and user state
-            3. **Proactive**: Anticipate needs, suggest relevant options
-            4. **Validate Data**: Confirm critical info (quantities, dates, prices, locations)
-            5. **Natural Flow**: Don't list all options unless asked - guide conversationally
-
-            ---
-
-            ## CUSTOMER INTERACTIONS
-
-            ### Registration (New Users)
-            Collect: Name, Phone Number, Default Delivery Location
-            - Keep it conversational: "Welcome to KCartBot! 🥬 What's your name?"
-            - Validate phone format and location details
-
-            ### Discovery & Advisory (RAG Knowledge)
-            You know about:
-            - Storage tips ("Store tomatoes at room temp, not fridge")
-            - Nutrition ("Avocados have 3x calories of bananas - healthy fats!")
-            - Seasonality ("Mangoes are in season now - sweetest in June-August")
-            - Selection ("Ripe mangoes yield slightly to pressure, smell sweet at stem")
-            - Preparation & recipes
-
-            **Answer advisory questions directly and helpfully**, then offer to help them order.
-
-            ### Ordering Flow
-            1. **Parse Natural Language**: "5kg red onions and 2L milk" → extract items/quantities
-            2. **Check Availability**: Query stock, confirm or suggest alternatives
-            3. **Ask Delivery Date**: "When would you like delivery?"
-            4. **Confirm Location**: "Send to [default address] or somewhere else?"
-            5. **Show Summary**: 
-            ```
-            📦 Order Summary:
-            - 5kg Red Onions - 275 ETB
-            - 2L Milk - 130 ETB
-            Total: 405 ETB | Delivery: [Date] at [Location]
-            ```
-            6. **Get Confirmation**: "Confirm this order?"
-
-            ### Payment (COD Only)
-            When user confirms:
-            1. Say: "Payment is Cash on Delivery. Confirming your order..."
-            2. [AUTO: 5-second pause]
-            3. Auto-reply: "✅ Order Confirmed! Order #[ID]. Total: [Amount] ETB (pay on delivery). You'll get updates soon!"
-
-            ---
-
-            ## SUPPLIER INTERACTIONS
-
-            ### Registration
-            Collect: Name/Business Name, Phone Number
-            - Simple and quick: "Welcome to KCartBot Supplier Hub! 🚜 What's your business name?"
-
-            ### Product Addition
-            When supplier says "Add tomatoes" or similar:
-            1. **Quantity**: "How many kg available?"
-            2. **Delivery Dates**: "When can customers receive these?"
-            3. **Expiry (Optional)**: "Any expiry date? (Helps us suggest flash sales)"
-            4. **Pricing Intelligence** (CRITICAL):
-            ```
-            "Let me check market rates...
-            📊 Tomatoes Market Data:
-            - Local Shops: ~50 ETB/kg
-            - Supermarkets: ~65 ETB/kg  
-            - Sweet spot: 55 ETB/kg moves fast
-            
-            What price do you want to set?"
-            ```
-            5. **Image Generation**: "Generate a fresh image for these tomatoes?"
-
-            ### Stock Management
-            - **Check Stock**: "You have: Tomatoes (50kg), Onions (30kg)..."
-            - **Expiry Alerts** (Proactive): "⚠️ Your milk expires in 2 days. Run a 20% flash sale to clear it?"
-
-            ### Logistics & Schedule
-            - **Delivery Queries**: "Tuesday: 8 deliveries. Wednesday: 5 deliveries."
-            - **Weekly Overview**: Show schedule table when asked
-
-            ### Order Management
-            - **New Order Notification**: "🔔 New Order! Customer needs 10kg tomatoes by Thursday. Accept?"
-            - **Accept/Decline**: Track capacity, update supplier
-
-            ---
-
-            ## Response Guidelines
-            - **Be concise**: 1-3 sentences unless detail needed
-            - **Natural language**: "Great! Let's add those tomatoes" not "Processing product addition"
-            - **Use emojis sparingly**: 🥬🍅✅🔔 for clarity, not decoration
-            - **Confirm before acting**: Always get user confirmation for orders, price changes, etc.
-            - **Handle errors gracefully**: "I didn't catch that. Could you specify the quantity in kg?"
-            - **Suggest, don't overwhelm**: Offer next logical step, not full menu
-
-            ## Knowledge Base Access
-            When answering advisory questions:
-            - Provide accurate produce knowledge (storage, nutrition, seasonality)
-            - Cite confidence level if uncertain: "Typically..." or "Generally..."
-            - Offer to help order items discussed
-            - Suggest complementary products naturally
-
-            ## Data Handling
-            - **Currency**: Ethiopian Birr (ETB)
-            - **Weight**: Kilograms (kg)
-            - **Volume**: Liters (L)
-            - **Date Format**: Natural ("next Tuesday") or DD/MM/YYYY
-            - **Phone Format**: Validate Ethiopian numbers
-
-            ## Example Interactions
-
-            **Customer Advisory**:
-            User: "How do I store tomatoes?"
-            You: "Store tomatoes at room temperature, not in the fridge - cold kills their flavor! 🍅 They'll stay fresh for 3-5 days. Need to order some?"
-
-            **Customer Order**:
-            User: "I need 5kg onions and milk"
-            You: "Got it! 5kg red onions and how much milk - 1L or 2L?"
-
-            **Supplier Pricing**:
-            User: "Add 100kg carrots"
-            You: "Perfect! When can customers receive these carrots?"
-            [After dates/expiry...]
-            You: "📊 Market check: Carrots run 30-40 ETB/kg locally. 35 ETB moves well. Your price?"
-
-            **Proactive Flash Sale**:
-            You: "⚠️ Your spinach expires tomorrow. Flash sale at 40% off? Could clear your 15kg stock fast!"
-
-            ---
-
-            Remember: Be helpful, natural, and efficient. Guide users through flows conversationally, don't dump information. You're a knowledgeable friend helping them buy/sell fresh produce, not a robotic form-filler."""
+            You are KCartBot, a warm and efficient assistant for Ethiopia's fresh-goods marketplace. Keep every reply to one short paragraph and follow these guardrails:
+            - Identify whether the user is a customer or supplier and stay within that flow.
+            - Customers: gather missing name, phone, and delivery location if they're new. For orders capture items with kg or liter units, confirm availability, ask for delivery date/location, present a concise ETB summary, remind them payment is Cash on Delivery, then confirm once details and order items succeed.
+            - Suppliers: help onboard quickly, collect product name, quantity, unit price, delivery schedule, and expiry one detail at a time, and share pricing guidance before submitting inventory updates.
+            - Always use ETB currency and kg/liter units, reuse known context, ask for missing details individually, and keep the tone pragmatic and friendly.
+            - When unsure, ask clarifying questions instead of guessing, and avoid multi-step instructions in a single reply.
+            """
         )
         if not self.config.api_key:
             settings = get_settings()
@@ -188,7 +65,8 @@ class LLMService:
             raise RuntimeError("DEEPSEEK_API_KEY is not set in configuration or environment.")
 
         self._external_client = http_client
-        self._request_timeout = 60.0
+        self._request_timeout = float(self.config.request_timeout or 45.0)
+        self._slow_request_threshold = float(self.config.slow_request_threshold or 8.0)
 
     def _headers(self) -> Mapping[str, str]:
         return {
@@ -283,7 +161,8 @@ class LLMService:
         **kwargs,
     ) -> str:
         """Generate a single-shot completion asynchronously with retries."""
-        payload = self._build_payload(prompt, history)
+        history_list = list(history or [])
+        payload = self._build_payload(prompt, history_list)
 
         async def _call() -> str:
             response = await self._post_json(payload)
@@ -293,8 +172,39 @@ class LLMService:
             except (KeyError, IndexError) as exc:  # pragma: no cover - defensive
                 raise RuntimeError(f"Unexpected DeepSeek response structure: {data}") from exc
             return content.strip()
-
-        return await self._retry(_call, action="completion")
+        metrics: Dict[str, Any] = {}
+        start = perf_counter()
+        prompt_chars = len(prompt or "")
+        history_entries = len(history_list)
+        history_chars = sum(len(item.get("content", "")) for item in history_list)
+        try:
+            result = await self._retry(_call, action="completion", metrics=metrics)
+        except LLMServiceError:
+            duration = perf_counter() - start
+            attempts = metrics.get("attempts", self.config.max_retries)
+            logger.error(
+                "LLM completion failed after %.2fs (attempts=%d, prompt_chars=%d, history_entries=%d, history_chars=%d, errors=%s)",
+                duration,
+                attempts,
+                prompt_chars,
+                history_entries,
+                history_chars,
+                metrics.get("errors"),
+            )
+            raise
+        else:
+            duration = perf_counter() - start
+            attempts = metrics.get("attempts", 1)
+            if duration >= self._slow_request_threshold or attempts > 1:
+                logger.warning(
+                    "LLM completion succeeded in %.2fs (attempts=%d, prompt_chars=%d, history_entries=%d, history_chars=%d)",
+                    duration,
+                    attempts,
+                    prompt_chars,
+                    history_entries,
+                    history_chars,
+                )
+            return result
 
     async def astream(
         self,
@@ -338,7 +248,12 @@ class LLMService:
                 if not self._should_retry(e, attempt):
                     self._raise_llm_error(e)
                 delay = self.config.retry_backoff * (2**attempt)
-                logger.warning(f"Retrying stream in {delay:.2f}s after error: {e}")
+                logger.warning(
+                    "Retrying stream in %.2fs after %s: %r",
+                    delay,
+                    type(e).__name__,
+                    e,
+                )
                 await asyncio.sleep(delay)
 
     def _compose_messages(
@@ -365,15 +280,29 @@ class LLMService:
         messages.append({"role": "user", "content": prompt})
         return messages
 
-    async def _retry(self, func, *, action: str):
+    async def _retry(self, func, *, action: str, metrics: Optional[Dict[str, Any]] = None):
         for attempt in range(self.config.max_retries):
             try:
-                return await func()
+                result = await func()
+                if metrics is not None:
+                    metrics["attempts"] = attempt + 1
+                return result
             except Exception as e:
+                if metrics is not None:
+                    metrics["attempts"] = attempt + 1
+                    metrics.setdefault("errors", []).append(repr(e) or str(e) or type(e).__name__)
                 if not self._should_retry(e, attempt):
+                    if metrics is not None:
+                        metrics["failed"] = True
                     self._raise_llm_error(e)
                 delay = self.config.retry_backoff * (2**attempt)
-                logger.warning(f"Retrying {action} in {delay:.2f}s after error: {e}")
+                logger.warning(
+                    "Retrying %s in %.2fs after %s: %r",
+                    action,
+                    delay,
+                    type(e).__name__,
+                    e,
+                )
                 await asyncio.sleep(delay)
         raise RuntimeError(f"{action.capitalize()} failed after {self.config.max_retries} retries.")
 
@@ -394,6 +323,11 @@ class LLMService:
         return isinstance(e, (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError))
 
     def _raise_llm_error(self, e: Exception) -> None:
-        raise RuntimeError(
-            f"LLM request failed: {e}. Verify your DeepSeek API key and model '{self.config.model}' is available."
+        detail = str(e).strip()
+        if not detail:
+            detail = repr(e)
+        if not detail:
+            detail = type(e).__name__
+        raise LLMServiceError(
+            f"LLM request failed: {detail}. Verify your DeepSeek API key and model '{self.config.model}' is available."
         ) from e

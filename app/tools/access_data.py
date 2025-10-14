@@ -1,14 +1,18 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import json
 import asyncio
+import calendar
+import re
 from datetime import datetime, timedelta, date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+import uuid
 from uuid import UUID
 
 from tortoise import Tortoise
 from tortoise.exceptions import IntegrityError, ConfigurationError
 from tortoise.models import Model
 from tortoise.queryset import QuerySet
+from tortoise.transactions import in_transaction
 from tortoise.fields.relational import (
     BackwardFKRelation,
     ForeignKeyFieldInstance,
@@ -26,6 +30,9 @@ from app.db.models import (
     Month,
     SupplierProduct,
     CompetitorTier,
+    PaymentMethod,
+    TransactionStatus,
+    OrderItem,
 )
 from app.db.repository.user_repository import UserRepository
 from app.db.repository.product_repository import ProductRepository
@@ -34,13 +41,13 @@ from app.db.repository.competitor_price_repository import CompetitorPriceReposit
 from app.db.repository.transaction_repository import TransactionRepository
 from app.db.repository.order_item_repository import OrderItemRepository
 from app.db.repository.flash_sale_repository import FlashSaleRepository
+from app.tools.schedule_tool import ScheduleTool
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from app.core.tortoise_config import init_db
 from app.utils.schedule import parse_delivery_schedule
 
 
 _db_init_lock = asyncio.Lock()
-
 
 async def ensure_db_initialized() -> None:
     """Initialise Tortoise ORM lazily when tools run outside FastAPI lifecycle."""
@@ -79,7 +86,6 @@ class DataAccessRequest(BaseModel):
         if not isinstance(value, str):
             raise TypeError("operation must be a string")
         return value.strip().lower()
-
 
 class AnalyticsRequest(BaseModel):
     operation: str = Field(description="Analytics operation to execute")
@@ -126,6 +132,7 @@ class DataAccessTool(ToolBase):
             "order_items": OrderItemRepository,
             "flash_sales": FlashSaleRepository,
         }
+        self._schedule_tool = ScheduleTool()
         self._supported_operations = ["list", "get", "search", "create", "update", "delete"]
         self._repository_methods: Dict[str, Dict[str, str]] = {
             "users": {
@@ -171,54 +178,72 @@ class DataAccessTool(ToolBase):
                 "delete": "delete_flash_sale",
             },
         }
+        self._active_context: Dict[str, Any] = {}
 
     async def run(self, input: Dict[str, Any], context: Dict[str, Any] = None) -> Any:
         """Execute validated data access operations and surface friendly errors."""
-        await ensure_db_initialized()
+        self._active_context = context or {}
         try:
-            if isinstance(input, str):
-                try:
-                    input = json.loads(input)
-                except json.JSONDecodeError:
-                    return {"error": "Invalid JSON payload for data_access tool."}
-            request = DataAccessRequest.model_validate(input)
-        except ValidationError as exc:
-            return {
-                "error": "Invalid data_access request.",
-                "details": exc.errors(),
-            }
-        except Exception as exc:  # pragma: no cover - defensive logging
-            return {"error": f"Unexpected validation error: {exc}"}
+            await ensure_db_initialized()
+            try:
+                if isinstance(input, str):
+                    try:
+                        input = json.loads(input)
+                    except json.JSONDecodeError:
+                        return {"error": "Invalid JSON payload for data_access tool."}
+                request = DataAccessRequest.model_validate(input)
+            except ValidationError as exc:
+                return {
+                    "error": "Invalid data_access request.",
+                    "details": exc.errors(),
+                }
+            except Exception as exc:  # pragma: no cover - defensive logging
+                return {"error": f"Unexpected validation error: {exc}"}
 
-        entity = request.entity
-        operation = request.operation
-        repository = self.repositories.get(entity)
+            entity = request.entity
+            operation = request.operation
+            repository = self.repositories.get(entity)
 
-        if repository is None:
-            return {
-                "error": f"Unknown entity: {entity}.",
-                "valid_entities": list(self.repositories.keys()),
-            }
+            if repository is None:
+                return {
+                    "error": f"Unknown entity: {entity}.",
+                    "valid_entities": list(self.repositories.keys()),
+                }
 
-        try:
-            if operation == "get":
-                return await self._get_by_id(repository, entity, request.id)
-            if operation == "list":
-                return await self._list_entities(repository, request.filters, request.limit)
-            if operation == "search":
-                return await self._search_entities(repository, request.filters, request.limit)
-            if operation == "create":
-                return await self._create_entity(repository, entity, request.data)
-            if operation == "update":
-                return await self._update_entity(entity, request.id, request.data)
-            if operation == "delete":
-                return await self._delete_entity(entity, request.id)
-            return {
-                "error": f"Unknown operation: {operation}.",
-                "valid_operations": self._supported_operations,
-            }
-        except Exception as exc:  # pragma: no cover - repository level errors
-            return {"error": f"Error accessing data: {exc}"}
+            try:
+                if operation == "get":
+                    return await self._get_by_id(repository, entity, request.id)
+                if operation == "list":
+                    return await self._list_entities(repository, request.filters, request.limit)
+                if operation == "search":
+                    return await self._search_entities(repository, request.filters, request.limit)
+                if operation == "create":
+                    return await self._create_entity(repository, entity, request.data)
+                if operation == "update":
+                    if (
+                        entity == "order_items"
+                        and (
+                            "delivery_date" in request.data
+                            or "preferred_delivery_date" in request.data
+                        )
+                    ):
+                        return await self._update_order_delivery(request)
+                    return await self._update_entity(
+                        entity,
+                        request.id,
+                        request.data,
+                        request.filters,
+                    )
+                if operation == "delete":
+                    return await self._delete_entity(entity, request.id)
+                return {
+                    "error": f"Unknown operation: {operation}.",
+                    "valid_operations": self._supported_operations,
+                }
+            except Exception as exc:  # pragma: no cover - repository level errors
+                return {"error": f"Error accessing data: {exc}"}
+        finally:
+            self._active_context = {}
 
     async def _get_by_id(self, repository, entity: str, entity_id: Any) -> Dict[str, Any]:
         """Retrieve a single entity by ID."""
@@ -258,10 +283,14 @@ class DataAccessTool(ToolBase):
         list_methods = [m for m in dir(repository) if m.startswith('list_')]
         if not list_methods:
             return {"error": "No list method found for repository"}
-        
+
+        normalised_filters = await self._maybe_expand_special_filters(repository, filters or {})
+        if normalised_filters is None:
+            return {"count": 0, "results": []}
+
         # Call the list method
         list_method = getattr(repository, list_methods[0])
-        entities = await list_method(filters)
+        entities = await list_method(normalised_filters)
         
         # Apply limit if specified
         if limit and isinstance(entities, list):
@@ -270,12 +299,45 @@ class DataAccessTool(ToolBase):
         # Serialize results
         results = []
         for entity_obj in entities:
-            results.append(await self._serialize_model(entity_obj))
-        
+            serialized = await self._serialize_model(entity_obj)
+            if serialized is not None:
+                results.append(serialized)
+
         return {
             "count": len(results),
-            "results": results
+            "results": results,
         }
+
+    def _get_list_method(self, repository):
+        list_methods = [m for m in dir(repository) if m.startswith("list_")]
+        if not list_methods:
+            return None
+        return getattr(repository, list_methods[0])
+
+    async def _fetch_repository_records(
+        self,
+        repository,
+        filters: Optional[Dict[str, Any]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Any]:
+        list_method = self._get_list_method(repository)
+        if not list_method:
+            return []
+        normalised_filters = await self._maybe_expand_special_filters(repository, filters or {})
+        if normalised_filters is None:
+            return []
+        records = await list_method(normalised_filters)
+        if isinstance(records, list) and limit is not None:
+            return records[:limit]
+        return records if isinstance(records, list) else []
+
+    @staticmethod
+    def _extract_pk(model: Any) -> Any:
+        meta = getattr(model, "_meta", None)
+        pk_attr = getattr(meta, "pk_attr", None) if meta else None
+        if pk_attr and hasattr(model, pk_attr):
+            return getattr(model, pk_attr)
+        return getattr(model, "id", None)
 
     async def _search_entities(
         self, 
@@ -289,7 +351,324 @@ class DataAccessTool(ToolBase):
                 "error": "Filters are required for 'search' operation. "
                 "Use 'list' operation without filters to get all entities."
             }
+
+        normalised_filters = await self._maybe_expand_special_filters(repository, filters)
+        if normalised_filters is None:
+            # Special filter expansion determined that no results are possible.
+            return {"count": 0, "results": []}
+
         return await self._list_entities(repository, filters, limit)
+
+    async def _maybe_expand_special_filters(
+        self,
+        repository,
+        filters: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Handle repository-specific filter conveniences (e.g., product name lookups)."""
+        if not filters:
+            return {}
+
+        entity_name = getattr(repository, "__name__", "")
+        working = dict(filters)
+
+        if entity_name == "ProductRepository":
+            name_terms: List[str] = []
+            for key in ("name", "product_name"):
+                if key in working:
+                    value = working.pop(key)
+                    if isinstance(value, (list, tuple, set)):
+                        name_terms.extend(str(item).strip() for item in value if str(item).strip())
+                    elif isinstance(value, str) and value.strip():
+                        name_terms.append(value.strip())
+            if name_terms:
+                product_ids: List[Any] = []
+                seen: set[Any] = set()
+                for term in name_terms:
+                    product = await ProductRepository.find_product_by_any_name(term)
+                    if product and product.product_id not in seen:
+                        seen.add(product.product_id)
+                        product_ids.append(product.product_id)
+                if not product_ids:
+                    return None
+                working.setdefault("product_id", {"lookup": "in", "value": product_ids})
+        
+        elif entity_name == "SupplierProductRepository":
+            name_terms: List[str] = []
+            for key in ("product_name", "name"):
+                if key in working:
+                    value = working.pop(key)
+                    if isinstance(value, (list, tuple, set)):
+                        name_terms.extend(str(item).strip() for item in value if str(item).strip())
+                    elif isinstance(value, str) and value.strip():
+                        name_terms.append(value.strip())
+            if name_terms:
+                product_ids: List[Any] = []
+                seen: set[Any] = set()
+                for term in name_terms:
+                    product = await ProductRepository.find_product_by_any_name(term)
+                    if product and product.product_id not in seen:
+                        seen.add(product.product_id)
+                        product_ids.append(product.product_id)
+                if not product_ids:
+                    return None
+                working.setdefault("product_id", {"lookup": "in", "value": product_ids})
+
+            supplier_terms: List[str] = []
+            for key in ("supplier_name", "supplier_label"):
+                if key in working:
+                    value = working.pop(key)
+                    if isinstance(value, (list, tuple, set)):
+                        supplier_terms.extend(str(item).strip() for item in value if str(item).strip())
+                    elif isinstance(value, str) and value.strip():
+                        supplier_terms.append(value.strip())
+
+            raw_supplier = working.pop("supplier", None)
+            if isinstance(raw_supplier, dict):
+                working.setdefault("supplier_id", raw_supplier)
+            elif isinstance(raw_supplier, (int, float)):
+                working.setdefault("supplier_id", int(raw_supplier))
+            elif isinstance(raw_supplier, str) and raw_supplier.strip():
+                supplier_terms.append(raw_supplier.strip())
+            elif isinstance(raw_supplier, (list, tuple, set)):
+                supplier_terms.extend(str(item).strip() for item in raw_supplier if str(item).strip())
+
+            if supplier_terms:
+                supplier_ids: List[int] = []
+                seen_suppliers: set[int] = set()
+                for name in supplier_terms:
+                    supplier = await UserRepository.get_user_by_name(name)
+                    if supplier and getattr(supplier, "role", None) == UserRole.SUPPLIER:
+                        supplier_id_val = int(supplier.user_id)
+                        if supplier_id_val not in seen_suppliers:
+                            seen_suppliers.add(supplier_id_val)
+                            supplier_ids.append(supplier_id_val)
+                if not supplier_ids:
+                    return None
+                if "supplier_id" in working and isinstance(working["supplier_id"], dict):
+                    existing = working["supplier_id"].get("value")
+                    if isinstance(existing, list):
+                        merged = list({*existing, *supplier_ids})
+                        working["supplier_id"]["value"] = merged
+                    else:
+                        working["supplier_id"] = {"lookup": working["supplier_id"].get("lookup", "in"), "value": supplier_ids}
+                else:
+                    working.setdefault("supplier_id", {"lookup": "in", "value": supplier_ids})
+
+            delivery_override = working.pop("delivery_location", None)
+            if delivery_override:
+                if isinstance(delivery_override, dict):
+                    working.setdefault("supplier__default_location", delivery_override)
+                else:
+                    working.setdefault(
+                        "supplier__default_location",
+                        {"lookup": "iexact", "value": str(delivery_override).strip()},
+                    )
+
+            quantity_filters: Dict[str, Any] = {}
+            for key in list(working.keys()):
+                if key in ("available_quantity", "quantity"):
+                    quantity_filters[key] = working.pop(key)
+
+            if quantity_filters:
+                normalised_lookup: Dict[str, Any] = {}
+                comparison_aliases = {
+                    "gte": "gte",
+                    "gt": "gt",
+                    "lte": "lte",
+                    "lt": "lt",
+                    "eq": "exact",
+                    "exact": "exact",
+                }
+                for _, value in quantity_filters.items():
+                    lookup_name: Optional[str] = None
+                    lookup_value: Any = None
+                    if isinstance(value, dict):
+                        lookup_name = value.get("lookup") or value.get("op")
+                        lookup_value = value.get("value")
+                        if not lookup_name and len(value) == 1:
+                            single_key, single_val = next(iter(value.items()))
+                            if single_key in comparison_aliases:
+                                lookup_name = comparison_aliases[single_key]
+                                lookup_value = single_val
+                        if lookup_name and lookup_value is None and lookup_name in value:
+                            lookup_value = value.get(lookup_name)
+                    else:
+                        lookup_value = value
+                        lookup_name = "gte"
+                    if lookup_name and lookup_value is not None:
+                        normalised_lookup[f"quantity_available__{lookup_name}"] = lookup_value
+                working.update(normalised_lookup)
+
+        elif entity_name == "OrderItemRepository":
+            order_reference = working.pop("order_reference", None)
+            if order_reference is not None and "order_id" not in working:
+                working["order_id"] = order_reference
+
+            order_id_value = working.get("order_id")
+            if isinstance(order_id_value, dict):
+                values = order_id_value.get("value")
+                if isinstance(values, (list, tuple, set)):
+                    normalised_values: List[str] = []
+                    for candidate in values:
+                        try:
+                            normalised_values.append(str(uuid.UUID(str(candidate).strip())))
+                        except (ValueError, AttributeError):
+                            continue
+                    if not normalised_values:
+                        return None
+                    order_id_value = {"lookup": order_id_value.get("lookup", "in"), "value": normalised_values}
+                    working["order_id"] = order_id_value
+                else:
+                    candidate = order_id_value.get("value")
+                    if candidate is None and order_id_value.get("lookup") in order_id_value:
+                        candidate = order_id_value.get(order_id_value.get("lookup"))
+                    if candidate is None:
+                        return None
+                    try:
+                        working["order_id"] = str(uuid.UUID(str(candidate).strip()))
+                    except (ValueError, AttributeError):
+                        return None
+            elif order_id_value is not None:
+                try:
+                    working["order_id"] = str(uuid.UUID(str(order_id_value).strip()))
+                except ValueError:
+                    return None
+
+            user_filter = working.pop("user_id", None)
+            if user_filter is not None:
+                working["order__user_id"] = user_filter
+
+            status_filter = working.pop("status", None)
+            if status_filter is not None:
+                status_enum = self._normalise_transaction_status(status_filter)
+                if status_enum is not None:
+                    working["order__status"] = status_enum.value
+
+            delivery_filter = None
+            delivery_lookup = "exact"
+            for key in ("delivery_date", "preferred_delivery_date"):
+                if key in working:
+                    raw_value = working.pop(key)
+                    if isinstance(raw_value, dict):
+                        delivery_lookup = raw_value.get("lookup") or raw_value.get("op") or "exact"
+                        delivery_filter = raw_value.get("value")
+                        if delivery_filter is None and delivery_lookup in raw_value:
+                            delivery_filter = raw_value.get(delivery_lookup)
+                    else:
+                        delivery_filter = raw_value
+                    break
+            if delivery_filter is not None:
+                parsed_date = self._parse_date(delivery_filter)
+                if parsed_date is not None:
+                    if delivery_lookup and delivery_lookup.lower() not in {"exact", "eq"}:
+                        working["order__delivery_date"] = {"lookup": delivery_lookup, "value": parsed_date}
+                    else:
+                        working["order__delivery_date"] = parsed_date
+
+            product_name_filter = working.pop("product_name", None)
+            name_terms: List[str] = []
+            if product_name_filter is not None:
+                if isinstance(product_name_filter, (list, tuple, set)):
+                    name_terms.extend(
+                        str(item).strip() for item in product_name_filter if str(item).strip()
+                    )
+                elif isinstance(product_name_filter, str) and product_name_filter.strip():
+                    name_terms.append(product_name_filter.strip())
+            if name_terms:
+                product_ids: List[Any] = []
+                seen: set[Any] = set()
+                for term in name_terms:
+                    product = await ProductRepository.find_product_by_any_name(term)
+                    if product and product.product_id not in seen:
+                        seen.add(product.product_id)
+                        product_ids.append(product.product_id)
+                if not product_ids:
+                    return None
+                working.setdefault("product_id", {"lookup": "in", "value": product_ids})
+
+        elif entity_name == "TransactionRepository":
+            order_reference = working.pop("order_reference", None)
+            if order_reference is not None and "order_id" not in working:
+                working["order_id"] = order_reference
+
+            order_id_value = working.get("order_id")
+            if isinstance(order_id_value, dict):
+                lookup = order_id_value.get("lookup") or order_id_value.get("op") or "in"
+                values = order_id_value.get("value")
+                if values is None and lookup in order_id_value:
+                    values = order_id_value.get(lookup)
+                if isinstance(values, (list, tuple, set)):
+                    normalised_values: List[str] = []
+                    for candidate in values:
+                        try:
+                            normalised_values.append(str(uuid.UUID(str(candidate).strip())))
+                        except (ValueError, AttributeError):
+                            continue
+                    if not normalised_values:
+                        return None
+                    working["order_id"] = {"lookup": lookup, "value": normalised_values}
+                elif values is not None:
+                    try:
+                        working["order_id"] = str(uuid.UUID(str(values).strip()))
+                    except (ValueError, AttributeError):
+                        return None
+                else:
+                    return None
+            elif order_id_value is not None:
+                try:
+                    working["order_id"] = str(uuid.UUID(str(order_id_value).strip()))
+                except ValueError:
+                    return None
+
+            status_filter = working.get("status")
+            if status_filter is not None:
+                status_enum = self._normalise_transaction_status(status_filter)
+                if status_enum is not None:
+                    working["status"] = status_enum.value
+                else:
+                    working.pop("status", None)
+
+            preferred_delivery = working.pop("preferred_delivery_date", None)
+            if "delivery_date" in working:
+                existing = working["delivery_date"]
+                delivery_lookup = "exact"
+                delivery_value = existing
+                if isinstance(existing, dict):
+                    delivery_lookup = existing.get("lookup") or existing.get("op") or "exact"
+                    delivery_value = existing.get("value")
+                    if delivery_value is None and delivery_lookup in existing:
+                        delivery_value = existing.get(delivery_lookup)
+                parsed_delivery = self._parse_date(delivery_value)
+                if parsed_delivery is not None:
+                    if isinstance(existing, dict) and delivery_lookup.lower() not in {"exact", "eq"}:
+                        working["delivery_date"] = {"lookup": delivery_lookup, "value": parsed_delivery}
+                    else:
+                        working["delivery_date"] = parsed_delivery
+                else:
+                    working.pop("delivery_date", None)
+            if preferred_delivery is not None:
+                parsed_preferred = self._parse_date(preferred_delivery)
+                if parsed_preferred is not None:
+                    working["delivery_date"] = parsed_preferred
+
+        return self._normalise_filters(working)
+
+    def _normalise_filters(self, filters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not filters:
+            return {}
+        prepared: Dict[str, Any] = {}
+        for key, value in filters.items():
+            if isinstance(value, dict):
+                prepared[key] = value
+                continue
+            if isinstance(value, (list, tuple, set)):
+                items = [item for item in value if item is not None]
+                if not items:
+                    continue
+                prepared[key] = {"lookup": "in", "value": items}
+                continue
+            prepared[key] = value
+        return prepared
 
     async def _serialize_model(self, model) -> Dict[str, Any]:
         """Convert Tortoise ORM model instances to plain dictionaries."""
@@ -315,6 +694,12 @@ class DataAccessTool(ToolBase):
             value = getattr(model, field_name, None)
             data[field_name] = self._normalise_value(value)
 
+        if isinstance(model, OrderItem):
+            product = getattr(model, "product", None)
+            if product is not None:
+                data.setdefault("product_id", getattr(model, "product_id", None))
+                data["product_name"] = getattr(product, "product_name_en", None)
+                data.setdefault("unit", DataAccessTool._normalise_value(getattr(product, "unit", None)))
         if isinstance(model, SupplierProduct):
             product = getattr(model, "product", None)
             if product is not None:
@@ -514,10 +899,528 @@ class DataAccessTool(ToolBase):
             )
         return result
 
+    async def _resolve_order_id_for_items(
+        self,
+        payload: Dict[str, Any],
+    ) -> Tuple[Optional[Any], Optional[Dict[str, Any]], List[str]]:
+        notes: List[str] = []
+
+        explicit_source: Optional[str] = None
+        explicit_order_id: Optional[UUID] = None
+        explicit_raw: Optional[Any] = None
+        explicit_invalid = False
+        for key in ("order_id", "order_reference", "transaction_id"):
+            candidate = payload.get(key)
+            if candidate:
+                explicit_source = key
+                explicit_raw = candidate
+                explicit_order_id = self._normalise_order_id(candidate)
+                if explicit_order_id is None:
+                    explicit_invalid = True
+                break
+
+        user_id_value = (
+            payload.get("user_id")
+            or payload.get("customer_id")
+            or payload.get("buyer_id")
+        )
+        user_id = self._normalise_user_id(user_id_value)
+        context_user_name: Optional[str] = None
+        if user_id is None:
+            context_user_id, context_user_name = self._extract_context_user()
+            if context_user_id is not None:
+                user_id = context_user_id
+                note_label = (
+                    f"Linked order to {context_user_name} from session context."
+                    if context_user_name
+                    else "Linked order to the signed-in customer from session context."
+                )
+                notes.append(note_label)
+
+        if user_id is None:
+            return None, {
+                "error": "order_id_required",
+                "message": "order_id is required when creating order items. Provide order_id explicitly, include user_id, or authenticate first so a recent order can be inferred.",
+            }, notes
+
+        filters: Dict[str, Any] = {"user_id": user_id}
+
+        status_hint = payload.get("status") or payload.get("order_status")
+        status_enum = None
+        if status_hint is not None:
+            status_enum = self._normalise_transaction_status(status_hint)
+            if status_enum is None:
+                notes.append("Ignoring unrecognised status hint while locating order_id.")
+        if status_enum is None:
+            status_enum = TransactionStatus.PENDING
+        filters["status"] = status_enum
+
+        delivery_raw = payload.get("delivery_date")
+        parsed_delivery: Optional[date] = None
+        if delivery_raw is not None:
+            parsed_delivery = self._parse_date(delivery_raw)
+            if parsed_delivery is not None:
+                filters["delivery_date"] = parsed_delivery
+            else:
+                notes.append("delivery_date could not be parsed when resolving order_id; searching without it.")
+
+        if explicit_order_id is not None:
+            existing_tx = await TransactionRepository.get_transaction_by_id(explicit_order_id)
+            if existing_tx:
+                notes.append(f"Using provided order reference {existing_tx.order_id}.")
+                return existing_tx.order_id, None, notes
+            auto_transaction, auto_error = await self._auto_create_transaction_for_items(
+                payload,
+                user_id,
+                status_enum,
+                parsed_delivery,
+                override_order_id=explicit_order_id,
+            )
+            if auto_error:
+                return None, auto_error, notes
+            if auto_transaction is not None:
+                notes.append(
+                    f"Created new order {auto_transaction.order_id} from the supplied {explicit_source or 'order reference'}."
+                )
+                return auto_transaction.order_id, None, notes
+        elif explicit_raw is not None and explicit_invalid:
+            notes.append("Ignored invalid order reference while creating the order; generated a fresh transaction instead.")
+
+        transactions = await self._fetch_repository_records(TransactionRepository, filters, limit=5)
+
+        # Fallback without status if nothing matched.
+        if not transactions:
+            fallback_filters = dict(filters)
+            fallback_filters.pop("status", None)
+            transactions = await self._fetch_repository_records(TransactionRepository, fallback_filters, limit=5)
+            if transactions:
+                notes.append("No pending orders matched; selected the most recent order instead.")
+
+        if not transactions:
+            auto_transaction, auto_error = await self._auto_create_transaction_for_items(
+                payload,
+                user_id,
+                status_enum,
+                parsed_delivery,
+            )
+            if auto_error:
+                return None, auto_error, notes
+            if auto_transaction is not None:
+                transactions = [auto_transaction]
+                notes.append(
+                    f"Created new order {auto_transaction.order_id} for user {user_id}."
+                )
+
+        if not transactions:
+            return None, {
+                "error": "order_id_required",
+                "message": "No matching order found for the provided details. Specify order_id explicitly or create a transaction first.",
+            }, notes
+
+        def _get_attr(record: Any, attr: str, default: Any = None) -> Any:
+            if isinstance(record, dict):
+                return record.get(attr, default)
+            return getattr(record, attr, default)
+
+        def _score(record: Any) -> datetime:
+            created = _get_attr(record, "created_at")
+            if isinstance(created, datetime):
+                return created
+            record_date = _get_attr(record, "date")
+            if isinstance(record_date, date):
+                return datetime.combine(record_date, datetime.min.time())
+            return datetime.min
+
+        selected = max(transactions, key=_score)
+        order_id_value = _get_attr(selected, "order_id") or _get_attr(selected, "id")
+        if not order_id_value:
+            return None, {
+                "error": "order_id_required",
+                "message": "Unable to determine order_id from recent transactions. Provide order_id explicitly.",
+            }, notes
+
+        notes.append(f"Linked order items to order {order_id_value} for user {user_id}.")
+        return order_id_value, None, notes
+
+    async def _auto_create_transaction_for_items(
+        self,
+        payload: Dict[str, Any],
+        user_id: Any,
+        status: TransactionStatus,
+        delivery_date: Optional[date],
+        override_order_id: Optional[UUID] = None,
+    ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
+        if user_id is None:
+            return None, {
+                "error": "order_id_required",
+                "message": "Unable to create an order without a recognised customer reference.",
+            }
+
+        user_id_normalised = self._normalise_user_id(user_id)
+        if user_id_normalised is None:
+            return None, {
+                "error": "order_id_required",
+                "message": "Customer reference was not recognised; provide a valid user_id before creating order items.",
+            }
+
+        total_hint = (
+            payload.get("total_price")
+            or payload.get("total_amount")
+            or payload.get("subtotal")
+            or payload.get("line_total")
+        )
+        total_val = self._parse_float(total_hint) if total_hint is not None else None
+        if total_val is None or total_val < 0:
+            total_val = 0.0
+
+        payment_hint = payload.get("payment_method") or payload.get("payment_type")
+        payment_method = self._normalise_payment_method(payment_hint) or PaymentMethod.COD
+
+        order_date_hint = payload.get("order_date") or payload.get("date")
+        order_date = self._parse_date(order_date_hint) or date.today()
+
+        create_kwargs: Dict[str, Any] = {
+            "user_id": user_id_normalised,
+            "date": order_date,
+            "delivery_date": delivery_date,
+            "total_price": float(total_val),
+            "payment_method": payment_method,
+            "status": status,
+        }
+        if override_order_id is not None:
+            create_kwargs["order_id"] = override_order_id
+
+        try:
+            transaction = await TransactionRepository.create_transaction(**create_kwargs)
+        except IntegrityError as exc:
+            return None, {
+                "error": "transaction_creation_failed",
+                "message": f"Unable to create transaction automatically: {exc}",
+            }
+        except Exception as exc:  # pragma: no cover - defensive
+            return None, {
+                "error": "transaction_creation_failed",
+                "message": f"Unexpected error while creating transaction: {exc}",
+            }
+
+        return transaction, None
+
+    async def _prepare_order_item_payload(
+        self,
+        data: Dict[str, Any],
+        *,
+        default_order_id: Optional[Any] = None,
+        default_supplier_id: Optional[int] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], List[str]]:
+        notes: List[str] = []
+        payload = dict(data)
+
+        supplier_product: Optional[SupplierProduct] = None
+        supplier_seed_id: Optional[int] = None
+        supplier_product_id = (
+            payload.get("supplier_product_id")
+            or payload.get("inventory_id")
+            or payload.get("supplier_inventory_id")
+        )
+        if supplier_product_id:
+            try:
+                supplier_product = await SupplierProductRepository.get_supplier_product_by_id(supplier_product_id)
+            except Exception as exc:  # pragma: no cover - defensive
+                notes.append(f"Unable to load supplier product {supplier_product_id}: {exc}")
+            else:
+                if not supplier_product:
+                    notes.append(f"Supplier product {supplier_product_id} was not found; continuing without it.")
+                else:
+                    supplier_seed_id = getattr(supplier_product, "supplier_id", None)
+                    product_id_from_inventory = getattr(supplier_product, "product_id", None)
+                    if product_id_from_inventory and not payload.get("product_id"):
+                        payload["product_id"] = product_id_from_inventory
+                    product_obj = getattr(supplier_product, "product", None)
+                    if not payload.get("product_name") and product_obj is not None:
+                        inferred_name = (
+                            getattr(product_obj, "product_name_en", None)
+                            or getattr(product_obj, "product_name", None)
+                        )
+                        if inferred_name:
+                            payload["product_name"] = inferred_name
+                    if payload.get("unit") in (None, ""):
+                        unit_from_inventory = getattr(supplier_product, "unit", None)
+                        if unit_from_inventory:
+                            payload["unit"] = unit_from_inventory
+                    if all(payload.get(alias) is None for alias in ("price_per_unit", "unit_price", "unit_price_etb")):
+                        price_from_inventory = getattr(supplier_product, "unit_price_etb", None)
+                        if price_from_inventory is not None:
+                            payload["price_per_unit"] = price_from_inventory
+
+        order_id = payload.get("order_id") or default_order_id
+        if not order_id:
+            resolved_order_id, resolve_error, auto_notes = await self._resolve_order_id_for_items(payload)
+            notes.extend(auto_notes)
+            if resolve_error:
+                return None, resolve_error, notes
+            order_id = resolved_order_id
+        payload["order_id"] = order_id
+
+        ignored_helper_fields = (
+            "user_id",
+            "customer_id",
+            "buyer_id",
+            "order_reference",
+            "transaction_id",
+            "delivery_date",
+            "status",
+            "order_status",
+        )
+        for helper_field in ignored_helper_fields:
+            payload.pop(helper_field, None)
+
+        supplier_name_hint = payload.pop("supplier_name", None)
+        supplier_source = payload.get("supplier_id")
+
+        def _apply_supplier_reference(
+            ref: Any,
+            current_id: Optional[int],
+            current_name: Optional[str],
+        ) -> Tuple[Optional[int], Optional[str]]:
+            if ref is None:
+                return current_id, current_name
+            if isinstance(ref, (int, float)):
+                if current_id is None:
+                    return int(ref), current_name
+                return current_id, current_name
+            if isinstance(ref, str):
+                candidate = ref.strip()
+                if not candidate:
+                    return current_id, current_name
+                if candidate.isdigit():
+                    if current_id is None:
+                        return int(candidate), current_name
+                    return current_id, current_name
+                return current_id, current_name or candidate
+            if isinstance(ref, dict):
+                value = ref.get("value") or ref.get("id")
+                name_val = ref.get("name") or ref.get("label")
+                if isinstance(name_val, str) and name_val.strip():
+                    current_name = current_name or name_val.strip()
+                if isinstance(value, (int, float)):
+                    if current_id is None:
+                        return int(value), current_name
+                    return current_id, current_name
+                if isinstance(value, str):
+                    value_str = value.strip()
+                    if value_str.isdigit():
+                        if current_id is None:
+                            return int(value_str), current_name
+                        return current_id, current_name
+                    current_name = current_name or value_str
+                return current_id, current_name
+            return current_id, current_name
+
+        supplier_id: Optional[int] = None
+        supplier_id, supplier_name_hint = _apply_supplier_reference(supplier_seed_id, supplier_id, supplier_name_hint)
+        supplier_id, supplier_name_hint = _apply_supplier_reference(default_supplier_id, supplier_id, supplier_name_hint)
+        supplier_id, supplier_name_hint = _apply_supplier_reference(supplier_source, supplier_id, supplier_name_hint)
+        supplier_id, supplier_name_hint = _apply_supplier_reference(payload.get("supplier"), supplier_id, supplier_name_hint)
+
+        payload.pop("supplier", None)
+        payload.pop("supplier_id", None)
+        payload.pop("supplier_product_id", None)
+        payload.pop("inventory_id", None)
+        payload.pop("supplier_inventory_id", None)
+
+        if supplier_name_hint and supplier_id is None:
+            supplier = await UserRepository.get_user_by_name(supplier_name_hint)
+            if not supplier or getattr(supplier, "role", None) != UserRole.SUPPLIER:
+                return None, {
+                    "error": "supplier_not_found",
+                    "message": f"Supplier '{supplier_name_hint}' was not recognised.",
+                }, notes
+            supplier_id = supplier.user_id
+            notes.append(f"Linked supplier {supplier.name} to order item.")
+
+        if supplier_id is not None:
+            try:
+                payload["supplier_id"] = int(supplier_id)
+            except (TypeError, ValueError):
+                payload["supplier_id"] = supplier_id
+
+        quantity_val = self._parse_float(payload.get("quantity"))
+        if quantity_val is None or quantity_val <= 0:
+            return None, {"error": "quantity must be a positive number."}, notes
+        payload["quantity"] = quantity_val
+
+        price_raw = (
+            payload.get("price_per_unit")
+            or payload.get("unit_price")
+            or payload.get("unit_price_etb")
+        )
+        price_val = self._parse_float(price_raw)
+        if price_val is None or price_val < 0:
+            return None, {"error": "price_per_unit must be a non-negative number."}, notes
+        payload["price_per_unit"] = price_val
+
+        subtotal_raw = (
+            payload.get("subtotal")
+            or payload.get("total_price")
+            or payload.get("line_total")
+        )
+        subtotal_val = self._parse_float(subtotal_raw) if subtotal_raw is not None else None
+        if subtotal_val is None:
+            subtotal_val = round(quantity_val * price_val, 2)
+        payload["subtotal"] = subtotal_val
+
+        product = None
+        product_id = payload.get("product_id") or payload.get("product")
+        product_name = payload.get("product_name") or payload.get("name")
+        if product_id:
+            product = await ProductRepository.get_product_by_id(product_id)
+            if not product:
+                return None, {"error": f"Product {product_id} not found for order item."}, notes
+        elif product_name:
+            product = await ProductRepository.find_product_by_any_name(product_name)
+            if not product:
+                return None, {"error": f"Product '{product_name}' not found for order item."}, notes
+        else:
+            return None, {"error": "product_id or product_name is required for order items."}, notes
+        payload["product_id"] = product.product_id
+
+        unit_value = payload.get("unit")
+        unit_enum = self._normalise_unit(unit_value)
+        if unit_enum is None and product is not None:
+            unit_enum = product.unit
+        if unit_enum is None:
+            return None, {"error": "unit is required for order items."}, notes
+        payload["unit"] = unit_enum
+
+        for alias in (
+            "unit_price",
+            "unit_price_etb",
+            "product_name",
+            "name",
+            "product",
+            "total_price",
+            "line_total",
+        ):
+            payload.pop(alias, None)
+
+        payload["quantity"] = float(payload["quantity"])
+        payload["price_per_unit"] = float(payload["price_per_unit"])
+        payload["subtotal"] = float(payload["subtotal"])
+        return payload, None, notes
+
+    async def _create_order_items_batch(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        payload = dict(data)
+        items = payload.get("items")
+        if not isinstance(items, list) or not items:
+            return {
+                "error": "items_required",
+                "message": "Provide a non-empty 'items' list to create multiple order items.",
+            }
+        notes: List[str] = []
+        order_id = payload.get("order_id")
+        if not order_id:
+            resolved_order_id, resolve_error, auto_notes = await self._resolve_order_id_for_items(payload)
+            notes.extend(auto_notes)
+            if resolve_error:
+                return resolve_error
+            order_id = resolved_order_id
+            payload["order_id"] = order_id
+        supplier_id = payload.get("supplier_id") or payload.get("supplier")
+        if payload.get("supplier_name") and not supplier_id:
+            supplier_id = payload.get("supplier_name")
+        extraneous_fields: List[str] = []
+        total_amount_raw = payload.get("total_amount")
+        for field in (
+            "customer_id",
+            "buyer_id",
+            "user_id",
+            "delivery_location",
+            "delivery_date",
+            "order_reference",
+            "transaction_id",
+            "order_status",
+            "status",
+            "total_amount",
+        ):
+            if field in payload:
+                extraneous_fields.append(field)
+                payload.pop(field, None)
+
+        normalised_items: List[Dict[str, Any]] = []
+        accum_subtotal = Decimal("0")
+        for item in items:
+            normalised, error, item_notes = await self._prepare_order_item_payload(
+                item,
+                default_order_id=order_id,
+                default_supplier_id=supplier_id,
+            )
+            if error:
+                return error
+            notes.extend(item_notes)
+            try:
+                accum_subtotal += Decimal(str(normalised.get("subtotal")))
+            except (InvalidOperation, TypeError):
+                pass
+            normalised_items.append(normalised)
+
+        created_records: List[Dict[str, Any]] = []
+        try:
+            async with in_transaction() as connection:
+                for normalised in normalised_items:
+                    instance = await OrderItemRepository.create_order_item(using_db=connection, **normalised)
+                    await instance.fetch_related("product")
+                    record = await self._serialize_model(instance)
+                    created_records.append(record)
+        except IntegrityError as exc:
+            return {"error": f"Order item batch creation failed: {exc}"}
+
+        if created_records:
+            await self._recalculate_transaction_total(order_id)
+
+        result: Dict[str, Any] = {
+            "message": "Order items created successfully.",
+            "records": created_records,
+        }
+        if extraneous_fields:
+            notes.append(
+                "Ignored unsupported fields during order item creation: "
+                + ", ".join(sorted(extraneous_fields))
+            )
+        if total_amount_raw is not None:
+            try:
+                total_amount_val = Decimal(str(total_amount_raw))
+                if accum_subtotal and abs(accum_subtotal - total_amount_val) > Decimal("0.05"):
+                    notes.append(
+                        f"Provided total_amount {total_amount_val} differs from computed subtotal {accum_subtotal}."
+                    )
+            except (InvalidOperation, TypeError):
+                pass
+        if notes:
+            result["notes"] = notes
+        return result
+
+    async def _recalculate_transaction_total(self, order_id: Any) -> None:
+        if not order_id:
+            return
+        try:
+            items = await OrderItemRepository.list_order_items({"order_id": order_id})
+        except Exception:
+            return
+        total = Decimal("0")
+        for item in items or []:
+            subtotal = getattr(item, "subtotal", None)
+            try:
+                total += Decimal(str(subtotal)) if subtotal is not None else Decimal("0")
+            except (InvalidOperation, TypeError):
+                continue
+        await TransactionRepository.update_transaction(order_id, total_price=float(total))
+
     async def _create_entity(self, repository, entity: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch create requests with entity-specific normalisation."""
         if not data:
             return {"error": "Data payload is required for 'create' operation."}
+
+        creation_notes: List[str] = []
 
         if entity == "supplier_products":
             return await self._create_supplier_product(data)
@@ -528,6 +1431,13 @@ class DataAccessTool(ToolBase):
 
         if entity == "users":
             payload = dict(data)
+            role_value = payload.get("role")
+            normalised_role = self._normalise_role(role_value) if role_value is not None else UserRole.SUPPLIER
+            if normalised_role == UserRole.CUSTOMER and not payload.get("default_location"):
+                return {
+                    "error": "default_location_required",
+                    "message": "Customer accounts need a default_location (e.g. kebele, district, or neighborhood). Suppliers do not require one.",
+                }
             if "preferred_language" in payload:
                 payload["preferred_language"] = self._normalise_preferred_language(payload["preferred_language"])
             if "role" in payload:
@@ -539,6 +1449,73 @@ class DataAccessTool(ToolBase):
                 payload["joined_date"] = joined_date
             data = payload
 
+        if entity == "transactions":
+            payload = dict(data)
+
+            alias_map = {
+                "customer_id": "user_id",
+                "buyer_id": "user_id",
+                "total_amount": "total_price",
+                "total": "total_price",
+            }
+            for source, target in alias_map.items():
+                if source in payload and target not in payload:
+                    payload[target] = payload.pop(source)
+
+            ignored_fields = []
+            for extraneous in ("delivery_location", "preferred_delivery_date"):
+                if extraneous in payload:
+                    payload.pop(extraneous)
+                    ignored_fields.append(extraneous)
+            if ignored_fields:
+                creation_notes.append(
+                    "Ignored unsupported fields during transaction creation: " + ", ".join(ignored_fields)
+                )
+
+            if "total_price" in payload:
+                total_price = self._parse_float(payload["total_price"])
+                if total_price is None or total_price < 0:
+                    return {"error": "total_price must be a non-negative number."}
+                payload["total_price"] = total_price
+
+            if "payment_method" in payload:
+                payment_method = self._normalise_payment_method(payload["payment_method"])
+                if payment_method is None:
+                    return {"error": "payment_method is not recognised for transactions."}
+                payload["payment_method"] = payment_method
+            else:
+                payload["payment_method"] = PaymentMethod.COD
+
+            if "status" in payload:
+                status = self._normalise_transaction_status(payload["status"])
+                if status is None:
+                    return {"error": "status is not recognised for transactions."}
+                payload["status"] = status
+            else:
+                payload["status"] = TransactionStatus.PENDING
+
+            for field in ("date", "delivery_date"):
+                if field in payload:
+                    parsed_date = self._parse_date(payload[field])
+                    if parsed_date is None:
+                        return {"error": f"{field} must be a valid ISO date or a keyword like 'today'."}
+                    payload[field] = parsed_date
+
+            if "date" not in payload:
+                payload["date"] = date.today()
+
+            data = payload
+
+        if entity == "order_items":
+            if isinstance(data, dict) and "items" in data:
+                return await self._create_order_items_batch(data)
+
+            payload, error, notes = await self._prepare_order_item_payload(data)
+            if error:
+                return error
+            data = payload
+            creation_notes.extend(notes)
+
         method = self._get_repo_method(entity, "create")
         if method is None:
             return {"error": f"'create' operation is not available for entity: {entity}."}
@@ -548,10 +1525,15 @@ class DataAccessTool(ToolBase):
         except IntegrityError as exc:
             return {"error": f"Create failed due to integrity error: {exc}"}
 
-        return {
+        result = {
             "message": "Record created successfully.",
             "record": await self._serialize_model(instance),
         }
+        if entity == "order_items":
+            await self._recalculate_transaction_total(data.get("order_id"))
+        if creation_notes:
+            result["notes"] = creation_notes
+        return result
 
     async def _create_product(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a product with sensible defaults when minimal data is provided."""
@@ -599,14 +1581,216 @@ class DataAccessTool(ToolBase):
             "record": await self._serialize_model(product),
         }
 
-    async def _update_entity(self, entity: str, entity_id: Any, data: Dict[str, Any]) -> Dict[str, Any]:
+    async def _update_order_delivery(self, request: DataAccessRequest) -> Dict[str, Any]:
+        filters = request.filters or {}
+        delivery_raw = request.data.get("delivery_date") or request.data.get("preferred_delivery_date")
+        delivery_value = None
+        if isinstance(delivery_raw, dict):
+            delivery_value = delivery_raw.get("value")
+            if delivery_value is None and delivery_raw.get("lookup") in delivery_raw:
+                delivery_value = delivery_raw.get(delivery_raw.get("lookup"))
+        else:
+            delivery_value = delivery_raw
+        if delivery_value is None:
+            return {"error": "delivery_date is required to update an order delivery."}
+
+        notes: List[str] = []
+        explicit_year = self._contains_explicit_year(delivery_value)
+        delivery_date, schedule_notes, reference_date = await self._resolve_delivery_date_with_schedule(
+            delivery_value
+        )
+        if schedule_notes:
+            notes.extend(schedule_notes)
+        if delivery_date is None:
+            delivery_date = self._parse_date(delivery_value)
+        if delivery_date is None:
+            error_payload: Dict[str, Any] = {
+                "error": "delivery_date must be a valid ISO date or a keyword like 'today'."
+            }
+            if notes:
+                error_payload["notes"] = notes
+            return error_payload
+
+        reference_date = max(reference_date, date.today())
+        if delivery_date < reference_date:
+            if not explicit_year and delivery_date.year < reference_date.year:
+                adjusted_date = self._roll_forward_delivery_date(delivery_date, reference_date)
+                if adjusted_date >= reference_date:
+                    notes.append(
+                        f"Adjusted delivery date to {adjusted_date.isoformat()} to keep it in the future."
+                    )
+                    delivery_date = adjusted_date
+                else:
+                    notes.append(
+                        "Unable to adjust the delivery date to a future value; please provide a full future date."
+                    )
+                    return {"error": "delivery_date must be in the future.", "notes": notes}
+            else:
+                notes.append(
+                    f"Resolved delivery date {delivery_date.isoformat()} is before {reference_date.isoformat()}."
+                )
+                notes.append("Please provide a future delivery date.")
+                return {"error": "delivery_date must be in the future.", "notes": notes}
+
+        # Try to resolve relevant order IDs based on the provided filters
+        candidate_order_ids: set[str] = set()
+        try:
+            order_item_records = await self._fetch_repository_records(
+                OrderItemRepository,
+                filters,
+                limit=25,
+            )
+            for record in order_item_records:
+                order_id_value = getattr(record, "order_id", None)
+                if order_id_value:
+                    candidate_order_ids.add(str(order_id_value))
+        except Exception:
+            # Continue even if order item lookup fails; we can still rely on broader filters
+            pass
+
+        tx_filters: Dict[str, Any] = {}
+        order_reference = filters.get("order_id") or filters.get("order_reference")
+        if order_reference is not None:
+            tx_filters["order_id"] = order_reference
+        user_filter = filters.get("user_id")
+        if user_filter is not None:
+            tx_filters["user_id"] = user_filter
+
+        status_filter = filters.get("status")
+        status_enum = None
+        if status_filter is not None:
+            status_enum = self._normalise_transaction_status(status_filter)
+            if status_enum is None:
+                return {"error": "status filter is not recognised for delivery updates."}
+            tx_filters["status"] = status_enum
+
+        normalised_filters = await self._maybe_expand_special_filters(
+            TransactionRepository,
+            tx_filters,
+        )
+        if normalised_filters is None:
+            normalised_filters = {}
+
+        if candidate_order_ids:
+            if "order_id" in normalised_filters and isinstance(normalised_filters["order_id"], dict):
+                existing = normalised_filters["order_id"].get("value")
+                if isinstance(existing, list):
+                    merged_set = set(existing)
+                    merged_set.update(candidate_order_ids)
+                    normalised_filters["order_id"] = {
+                        "lookup": normalised_filters["order_id"].get("lookup", "in"),
+                        "value": list(merged_set),
+                    }
+            elif "order_id" in normalised_filters:
+                merged_set = set(candidate_order_ids)
+                merged_set.add(str(normalised_filters["order_id"]))
+                normalised_filters["order_id"] = {"lookup": "in", "value": list(merged_set)}
+            else:
+                normalised_filters["order_id"] = {"lookup": "in", "value": list(candidate_order_ids)}
+
+        transactions = await TransactionRepository.list_transactions(normalised_filters)
+
+        if candidate_order_ids:
+            filtered_transactions = [
+                tx for tx in transactions if str(tx.order_id) in candidate_order_ids
+            ]
+            if filtered_transactions:
+                transactions = filtered_transactions
+            else:
+                notes.append(
+                    "No direct match for the provided order filters; falling back to the most recent pending order."
+                )
+
+        if not transactions and status_enum is not None:
+            fallback_filters = dict(normalised_filters)
+            fallback_filters.pop("status", None)
+            transactions = await TransactionRepository.list_transactions(fallback_filters)
+            if transactions:
+                notes.append(
+                    "No orders matched the requested status; updated the most recent matching order instead."
+                )
+
+        if not transactions and user_filter is not None and not normalised_filters:
+            transactions = await TransactionRepository.list_transactions({"user_id": user_filter})
+
+        if not transactions:
+            return {"error": "No matching order found to update the delivery date."}
+
+        selected = max(
+            transactions,
+            key=lambda tx: getattr(tx, "created_at", datetime.min),
+        )
+        if len(transactions) > 1:
+            notes.append(
+                "Multiple orders matched the filters; updated the most recent one."
+            )
+
+        updated = await TransactionRepository.update_transaction(
+            selected.order_id,
+            delivery_date=delivery_date,
+        )
+        if not updated:
+            return {"error": "Unable to update the delivery date for the selected order."}
+
+        try:
+            await updated.refresh_from_db()
+        except Exception:
+            pass
+
+        result = {
+            "message": "Delivery date updated successfully.",
+            "record": await self._serialize_model(updated),
+        }
+        if notes:
+            result["notes"] = notes
+        return result
+
+    async def _update_entity(
+        self,
+        entity: str,
+        entity_id: Any,
+        data: Dict[str, Any],
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Update records across repositories with light normalisation."""
-        if not entity_id:
-            return {"error": "ID is required for 'update' operation."}
         if not data:
             return {"error": "Data payload is required for 'update' operation."}
 
+        repository = self.repositories.get(entity)
+        if repository is None:
+            return {"error": f"Unknown entity: {entity}."}
+
+        resolved_id = entity_id
+        batch_matches: Optional[List[Any]] = None
+        matched_record: Optional[Any] = None
+        if not resolved_id:
+            if filters:
+                matches = await self._fetch_repository_records(repository, filters)
+                if not matches:
+                    return {"error": "No records matched the provided filters for update."}
+                if len(matches) > 1:
+                    if entity == "order_items":
+                        batch_matches = matches
+                    else:
+                        matched_ids = [
+                            str(self._extract_pk(record))
+                            for record in matches
+                            if self._extract_pk(record) is not None
+                        ]
+                        return {
+                            "error": "Multiple records matched update filters; provide an explicit id.",
+                            "matched_ids": matched_ids,
+                        }
+                else:
+                    matched_record = matches[0]
+                    resolved_id = self._extract_pk(matched_record)
+                    if resolved_id is None:
+                        return {"error": "Unable to determine record id for update."}
+            else:
+                return {"error": "ID is required for 'update' operation."}
+
         update_payload = dict(data)
+        order_status_update: Optional[TransactionStatus] = None
 
         if entity == "users":
             if "preferred_language" in update_payload:
@@ -673,6 +1857,82 @@ class DataAccessTool(ToolBase):
             if not update_payload:
                 return {"error": "No valid supplier product fields supplied for update."}
 
+        elif entity == "order_items":
+            normalised_payload: Dict[str, Any] = {}
+
+            if "quantity" in update_payload:
+                quantity_val = self._parse_float(update_payload["quantity"])
+                if quantity_val is None or quantity_val <= 0:
+                    return {"error": "quantity must be a positive number."}
+                normalised_payload["quantity"] = quantity_val
+
+            if any(key in update_payload for key in ("price_per_unit", "unit_price", "unit_price_etb")):
+                price_val = self._parse_float(
+                    update_payload.get("price_per_unit")
+                    or update_payload.get("unit_price")
+                    or update_payload.get("unit_price_etb")
+                )
+                if price_val is None or price_val < 0:
+                    return {"error": "price_per_unit must be a non-negative number."}
+                normalised_payload["price_per_unit"] = price_val
+
+            if "subtotal" in update_payload or "total_price" in update_payload:
+                subtotal_val = self._parse_float(
+                    update_payload.get("subtotal")
+                    or update_payload.get("total_price")
+                )
+                if subtotal_val is None or subtotal_val < 0:
+                    return {"error": "subtotal must be a non-negative number."}
+                normalised_payload["subtotal"] = subtotal_val
+
+            if "unit" in update_payload:
+                unit_enum = self._normalise_unit(update_payload["unit"])
+                if unit_enum is None:
+                    return {"error": "unit is not recognised for order items."}
+                normalised_payload["unit"] = unit_enum
+
+            product_override = (
+                update_payload.get("product_id")
+                or update_payload.get("product")
+            )
+            if product_override:
+                product = await ProductRepository.get_product_by_id(product_override)
+                if not product:
+                    return {"error": "Product not found for order item update."}
+                normalised_payload["product_id"] = product.product_id
+            elif update_payload.get("product_name"):
+                product = await ProductRepository.find_product_by_any_name(update_payload["product_name"])
+                if not product:
+                    return {"error": f"Product '{update_payload['product_name']}' not found for order item update."}
+                normalised_payload["product_id"] = product.product_id
+
+            supplier_hint = update_payload.get("supplier_id") or update_payload.get("supplier")
+            if supplier_hint is not None:
+                supplier_id_value: Optional[int] = None
+                if isinstance(supplier_hint, (int, float)):
+                    supplier_id_value = int(supplier_hint)
+                elif isinstance(supplier_hint, str) and supplier_hint.strip().isdigit():
+                    supplier_id_value = int(supplier_hint.strip())
+                if supplier_id_value is None:
+                    supplier = await UserRepository.get_user_by_name(str(supplier_hint)) if isinstance(supplier_hint, str) else None
+                    supplier_id_value = getattr(supplier, "user_id", None)
+                if supplier_id_value is None:
+                    return {"error": "supplier reference for order item update was not recognised."}
+                normalised_payload["supplier_id"] = supplier_id_value
+
+            if "status" in update_payload:
+                status_enum = self._normalise_transaction_status(update_payload["status"])
+                if status_enum is None:
+                    return {
+                        "error": "status is not recognised for order confirmation.",
+                        "hint": "Use Pending, Confirmed, Delivered, or Cancelled.",
+                    }
+                order_status_update = status_enum
+
+            update_payload = normalised_payload
+            if not update_payload and order_status_update is None:
+                return {"error": "No valid order item fields supplied for update."}
+
         elif entity == "flash_sales":
             normalised_payload = {}
             if "status" in update_payload:
@@ -707,14 +1967,53 @@ class DataAccessTool(ToolBase):
         if method is None:
             return {"error": f"'update' operation is not available for entity: {entity}."}
 
-        instance = await method(entity_id, **update_payload)
-        if not instance:
-            return {"error": f"{entity} with ID {entity_id} not found."}
+        order_ids_to_update: List[Any] = []
 
-        return {
-            "message": "Record updated successfully.",
-            "record": await self._serialize_model(instance),
-        }
+        if batch_matches is not None:
+            updated_records: List[Dict[str, Any]] = []
+            for match in batch_matches:
+                match_id = self._extract_pk(match)
+                if match_id is None:
+                    continue
+                instance = await method(match_id, **update_payload)
+                if not instance:
+                    continue
+                order_ids_to_update.append(getattr(instance, "order_id", None))
+                updated_records.append(await self._serialize_model(instance))
+
+            if not updated_records and order_status_update is None:
+                return {"error": "No matching order_items were updated."}
+
+            result: Dict[str, Any] = {
+                "message": f"{len(updated_records) or len(batch_matches)} order item(s) updated successfully.",
+            }
+            if updated_records:
+                result["records"] = updated_records
+
+        else:
+            instance = await method(resolved_id, **update_payload)
+            if not instance:
+                return {"error": f"{entity} with ID {resolved_id} not found."}
+            order_ids_to_update.append(getattr(instance, "order_id", None))
+            result = {
+                "message": "Record updated successfully.",
+                "record": await self._serialize_model(instance),
+            }
+
+        if order_status_update is not None:
+            status_notes: List[str] = []
+            for order_id in order_ids_to_update:
+                if not order_id:
+                    continue
+                updated_tx = await TransactionRepository.update_transaction(order_id, status=order_status_update)
+                if updated_tx:
+                    status_notes.append(
+                        f"Order {order_id} status set to {order_status_update.value}."
+                    )
+            if status_notes:
+                result.setdefault("notes", []).extend(status_notes)
+
+        return result
 
     async def _delete_entity(self, entity: str, entity_id: Any) -> Dict[str, Any]:
         """Delete records for supported entities."""
@@ -739,6 +2038,49 @@ class DataAccessTool(ToolBase):
         repository = self.repositories.get(entity)
         if repository and hasattr(repository, method_name):
             return getattr(repository, method_name)
+        return None
+
+    def _extract_context_user(self) -> Tuple[Optional[int], Optional[str]]:
+        context = getattr(self, "_active_context", None)
+        if not isinstance(context, dict):
+            return None, None
+        user_info = context.get("user")
+        if not isinstance(user_info, dict):
+            return None, None
+        user_id = self._normalise_user_id(
+            user_info.get("id") or user_info.get("user_id")
+        )
+        name = user_info.get("name") if isinstance(user_info.get("name"), str) else None
+        if name:
+            name = name.strip() or None
+        return user_id, name
+
+    @staticmethod
+    def _normalise_user_id(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str):
+            candidate = value.strip()
+            if candidate.isdigit():
+                return int(candidate)
+        return None
+
+    @staticmethod
+    def _normalise_order_id(value: Any) -> Optional[UUID]:
+        if value is None:
+            return None
+        if isinstance(value, UUID):
+            return value
+        if isinstance(value, str):
+            candidate = value.strip()
+            if not candidate:
+                return None
+            try:
+                return UUID(candidate)
+            except ValueError:
+                return None
         return None
 
     @staticmethod
@@ -770,11 +2112,111 @@ class DataAccessTool(ToolBase):
         if isinstance(value, date):
             return value
         if isinstance(value, str):
+            stripped = value.strip().lower()
+            if stripped in {"today", "now"}:
+                return date.today()
+            if stripped == "tomorrow":
+                return date.today() + timedelta(days=1)
+            if stripped == "yesterday":
+                return date.today() - timedelta(days=1)
             try:
-                return date.fromisoformat(value.split("T")[0])
+                return date.fromisoformat(stripped.split("T")[0])
             except ValueError:
                 return None
         return None
+
+    @staticmethod
+    def _contains_explicit_year(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, (date, datetime)):
+            return True
+        return bool(re.search(r"\b(19|20)\d{2}\b", str(value)))
+
+    @staticmethod
+    def _roll_forward_delivery_date(candidate: date, reference: date) -> date:
+        if candidate >= reference:
+            return candidate
+
+        def _replace_year(day: date, year: int) -> date:
+            try:
+                return day.replace(year=year)
+            except ValueError:
+                max_day = calendar.monthrange(year, day.month)[1]
+                return day.replace(year=year, day=min(day.day, max_day))
+
+        year = max(candidate.year, reference.year)
+        adjusted = _replace_year(candidate, year)
+        while adjusted < reference:
+            year = adjusted.year + 1
+            adjusted = _replace_year(candidate, year)
+        return adjusted
+
+    async def _resolve_delivery_date_with_schedule(self, value: Any) -> Tuple[Optional[date], List[str], date]:
+        notes: List[str] = []
+        reference_date = date.today()
+        if value is None:
+            return None, notes, reference_date
+        if isinstance(value, date):
+            return value, notes, reference_date
+        phrase = str(value).strip()
+        if not phrase:
+            return None, notes, reference_date
+        try:
+            result = await self._schedule_tool.run(
+                {
+                    "operation": "expiry_date",
+                    "phrase": phrase,
+                },
+                context={
+                    "current_date": reference_date.isoformat(),
+                    "reference_date": reference_date.isoformat(),
+                },
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            notes.append(f"schedule_helper error: {exc}")
+            return None, notes, reference_date
+
+        if not isinstance(result, dict):
+            notes.append("schedule_helper returned an unexpected payload format.")
+            return None, notes, reference_date
+
+        if result.get("error"):
+            error_detail = result.get("error")
+            if isinstance(error_detail, str):
+                notes.append(error_detail)
+            else:
+                notes.append("schedule_helper reported an error.")
+            return None, notes, reference_date
+
+        resolved = result.get("resolved_date")
+        if resolved:
+            try:
+                resolved_date = date.fromisoformat(str(resolved).split("T")[0])
+            except ValueError:
+                notes.append("schedule_helper produced an invalid date value.")
+                resolved_date = None
+        else:
+            resolved_date = None
+
+        reference_raw = result.get("reference_date")
+        if reference_raw:
+            try:
+                schedule_reference = date.fromisoformat(str(reference_raw).split("T")[0])
+                reference_date = max(reference_date, schedule_reference)
+            except ValueError:
+                notes.append("schedule_helper provided an invalid reference date.")
+
+        if resolved_date and resolved_date < reference_date:
+            notes.append(
+                f"schedule_helper resolved {resolved_date.isoformat()} before reference {reference_date.isoformat()}."
+            )
+
+        schedule_notes = result.get("notes")
+        if isinstance(schedule_notes, list):
+            notes.extend(str(item) for item in schedule_notes if item is not None)
+
+        return resolved_date, notes, reference_date
 
     @staticmethod
     def _parse_float(value: Any) -> Optional[float]:
@@ -835,6 +2277,32 @@ class DataAccessTool(ToolBase):
             for month in Month:
                 if month.value.lower() == normalised:
                     return month
+        return None
+
+    @staticmethod
+    def _normalise_payment_method(value: Any) -> Optional[PaymentMethod]:
+        if value is None:
+            return None
+        if isinstance(value, PaymentMethod):
+            return value
+        if isinstance(value, str):
+            normalised = value.strip().lower()
+            for method in PaymentMethod:
+                if method.value.lower() == normalised:
+                    return method
+        return None
+
+    @staticmethod
+    def _normalise_transaction_status(value: Any) -> Optional[TransactionStatus]:
+        if value is None:
+            return None
+        if isinstance(value, TransactionStatus):
+            return value
+        if isinstance(value, str):
+            normalised = value.strip().lower()
+            for status in TransactionStatus:
+                if status.value.lower() == normalised:
+                    return status
         return None
 
     @staticmethod
@@ -1015,7 +2483,7 @@ class AnalyticsDataTool(ToolBase):
         """Get statistics for a specific product."""
         if not product_id:
             return {"error": "product_id is required"}
-        
+
         # Get product details
         product = await ProductRepository.get_product_by_id(product_id)
         if not product:

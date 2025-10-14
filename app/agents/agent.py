@@ -25,7 +25,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import BaseTool
 
-from app.services.lllm_service import LLMService
+from app.services.llm_service import LLMService
 from app.tools import (
 	AnalyticsDataTool,
 	DataAccessTool,
@@ -551,6 +551,33 @@ class KcartAgent:
 		return label.lower()
 
 	@staticmethod
+	def _coerce_decimal(value: Any) -> Optional[Decimal]:
+		if value is None:
+			return None
+		try:
+			return Decimal(str(value))
+		except (InvalidOperation, ValueError, TypeError):
+			return None
+
+	def _format_quantity_phrase(self, quantity: Optional[Any], unit: Optional[Any]) -> Optional[str]:
+		amount = self._coerce_decimal(quantity)
+		if amount is None:
+			return None
+		quantity_display = self._format_decimal(amount)
+		if quantity_display and quantity_display.endswith(".00"):
+			quantity_display = quantity_display[:-3]
+		if quantity_display and "." in quantity_display:
+			quantity_display = quantity_display.rstrip("0").rstrip(".") or quantity_display
+		unit_label = self._normalise_unit_label(unit)
+		if unit_label == "liter" and amount != Decimal("1"):
+			unit_label = "liters"
+		elif unit_label in {"kilogram", "kilograms"}:
+			unit_label = "kg"
+		elif not unit_label:
+			unit_label = "units"
+		return f"{quantity_display} {unit_label}"
+
+	@staticmethod
 	def _find_listing_by_inventory_id(
 		tool_calls: Sequence[Dict[str, Any]],
 		inventory_id: Optional[str],
@@ -796,6 +823,169 @@ class KcartAgent:
 			)
 		return None
 
+	def _build_customer_order_prompt(
+		self,
+		tool_calls: List[Dict[str, Any]],
+		classifier_output: Optional[Dict[str, Any]],
+		user_input: Optional[str],
+	) -> Optional[str]:
+		user_role = None
+		if isinstance(self._context, dict):
+			user_info = self._context.get("user")
+			if isinstance(user_info, dict):
+				user_role = str(user_info.get("role") or "").lower()
+		if user_role and user_role != "customer":
+			return None
+
+		structured_items: List[Dict[str, Any]] = []
+		relevant_intent = False
+		if classifier_output:
+			flow_value = (classifier_output.get("flow") or "").lower()
+			if flow_value and flow_value != "customer":
+				return None
+			intent_label = classifier_output.get("intent") or ""
+			if intent_label.startswith("intent.supplier"):
+				return None
+			relevant_intent = intent_label in {
+				"intent.customer.place_order",
+				"intent.customer.check_availability",
+			}
+			filled_slots = classifier_output.get("filled_slots") or {}
+			order_items_slot = filled_slots.get("order_items")
+			if isinstance(order_items_slot, list):
+				structured_items = [item for item in order_items_slot if isinstance(item, dict)]
+			elif isinstance(order_items_slot, dict):
+				structured_items = [order_items_slot]
+			else:
+				maybe_item = {
+					"product_name": filled_slots.get("product_name"),
+					"quantity": filled_slots.get("quantity"),
+					"unit": filled_slots.get("unit"),
+					"supplier_name": filled_slots.get("supplier_name"),
+				}
+				if any(value for value in maybe_item.values()):
+					structured_items = [maybe_item]
+
+		selected_item: Dict[str, Any] = structured_items[0] if structured_items else {}
+		quantity_value = selected_item.get("quantity")
+		unit_value = selected_item.get("unit") or selected_item.get("unit_name")
+		product_hint = selected_item.get("product_name") or selected_item.get("name")
+		supplier_hint = selected_item.get("supplier_name") or selected_item.get("supplier")
+
+		parsed_quantity = self._coerce_decimal(quantity_value)
+		if parsed_quantity is None and user_input:
+			match = re.search(r"(\d+(?:\.\d+)?)\s*(kg|kgs?|kilograms?|liter|liters?|litres?|ltr|ltrs?)?", user_input, re.IGNORECASE)
+			if match:
+				parsed_quantity = self._coerce_decimal(match.group(1))
+				if not unit_value and match.group(2):
+					unit_value = match.group(2)
+
+		listing: Optional[Dict[str, Any]] = None
+		filter_product: Optional[str] = None
+		filter_supplier: Optional[str] = None
+		for call in reversed(tool_calls):
+			if call.get("tool") != "data_access":
+				continue
+			parsed_input = self._parse_tool_input(call.get("input"))
+			if not isinstance(parsed_input, dict):
+				continue
+			if parsed_input.get("entity") != "supplier_products" or parsed_input.get("operation") != "search":
+				continue
+			filters = parsed_input.get("filters") if isinstance(parsed_input.get("filters"), dict) else {}
+			if filter_product is None:
+				filter_product = filters.get("product_name") or filters.get("name")
+			if filter_supplier is None:
+				filter_supplier = filters.get("supplier_name") or filters.get("supplier")
+			observation = call.get("observation")
+			if isinstance(observation, dict):
+				results = observation.get("results")
+				if isinstance(results, list) and results:
+					listing = results[0]
+					break
+
+		if not listing:
+			return None
+
+		if not relevant_intent and not parsed_quantity and not structured_items:
+			if not user_input or not re.search(r"\b(order|buy|get|need)\b", user_input, re.IGNORECASE):
+				return None
+
+		product_label = (
+			product_hint
+			or (listing.get("product_name") if isinstance(listing, dict) else None)
+			or filter_product
+		)
+		supplier_label = supplier_hint or filter_supplier
+		if not product_label:
+			return None
+
+		listing_unit = listing.get("unit") if isinstance(listing, dict) else None
+		if unit_value is None:
+			unit_value = listing_unit
+		unit_price = None
+		if isinstance(listing, dict):
+			unit_price = (
+				listing.get("unit_price_etb")
+				or listing.get("unit_price")
+				or listing.get("price_per_unit")
+			)
+
+		available_qty = listing.get("quantity_available") if isinstance(listing, dict) else None
+		quantity_phrase = self._format_quantity_phrase(parsed_quantity, unit_value)
+		available_phrase = None
+		if available_qty is not None:
+			available_phrase = self._format_quantity_phrase(available_qty, listing_unit or unit_value)
+
+		price_display = self._format_decimal(unit_price)
+		if price_display and price_display.endswith(".00"):
+			price_display = price_display[:-3]
+		per_unit_label = self._normalise_unit_label(unit_value)
+		per_unit_suffix = ""
+		if per_unit_label == "kg":
+			per_unit_suffix = " per kg"
+		elif per_unit_label == "liter":
+			per_unit_suffix = " per liter"
+		elif per_unit_label:
+			per_unit_suffix = f" per {per_unit_label}"
+
+		total_display = None
+		if parsed_quantity is not None and unit_price is not None:
+			unit_price_decimal = self._coerce_decimal(unit_price)
+			if unit_price_decimal is not None:
+				total_display = self._format_decimal(parsed_quantity * unit_price_decimal)
+				if total_display and total_display.endswith(".00"):
+					total_display = total_display[:-3]
+
+		sentences: List[str] = []
+		if supplier_label:
+			lead_sentence = f"{supplier_label} has {product_label}"
+		else:
+			lead_sentence = f"I found {product_label}"
+		if price_display:
+			lead_sentence += f" at {price_display} ETB{per_unit_suffix}"
+		elif per_unit_label:
+			lead_sentence += f" sold per {per_unit_label}"
+		sentences.append(lead_sentence.strip() + ".")
+
+		if available_phrase:
+			sentences.append(f"Current stock: {available_phrase}.")
+		elif isinstance(listing, dict) and listing.get("is_expired"):
+			sentences.append("This batch is marked expired.")
+
+		if quantity_phrase:
+			if total_display:
+				sentences.append(f"I can line up {quantity_phrase} for roughly {total_display} ETB.")
+			else:
+				sentences.append(f"I can line up {quantity_phrase} for you.")
+		else:
+			sentences.append("How much should I add to your basket?")
+
+		if isinstance(listing, dict) and listing.get("expiry_date"):
+			sentences.append(f"Expiry: {listing['expiry_date']}.")
+
+		sentences.append("Should I go ahead and place the order and confirm delivery details?")
+		return " ".join(sentences)
+
 	def _build_schedule_followup(
 		self,
 		tool_calls: List[Dict[str, Any]],
@@ -856,6 +1046,10 @@ class KcartAgent:
 			return text
 
 		text = self._build_inventory_deletion_confirmation(tool_calls)
+		if text:
+			return text
+
+		text = self._build_customer_order_prompt(tool_calls, classifier_output, user_input)
 		if text:
 			return text
 

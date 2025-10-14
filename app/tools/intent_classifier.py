@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Literal
 
-from app.services.lllm_service import LLMService
+from app.services.llm_service import LLMService
 from app.tools.base import ToolBase
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
@@ -73,7 +73,7 @@ INTENT_REGISTRY: Dict[str, IntentDefinition] = {
 		flow="customer",
 		description="Customer wants to place a new order specifying items and quantities.",
 		required_slots=["order_items"],
-		optional_slots=["preferred_delivery_date", "special_instructions"],
+		optional_slots=["preferred_delivery_date", "delivery_date", "supplier_name"],
 		suggested_tools=["data_access", "analytics_data"],
 	),
 	"intent.customer.set_delivery_date": IntentDefinition(

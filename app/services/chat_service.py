@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
-from datetime import date
-from typing import Any, Dict, List, Optional
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
@@ -20,6 +21,11 @@ from app.db.repository.flash_sale_repository import FlashSaleRepository
 from app.db.repository.order_item_repository import OrderItemRepository
 from app.db.repository.supplier_product_repository import SupplierProductRepository
 from app.db.repository.user_repository import UserRepository
+from app.services.llm_service import LLMServiceError
+from app.tools.access_data import ensure_db_initialized
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -85,21 +91,40 @@ class ChatService:
 		if context:
 			merged_context.update(context)
 
-		turn: AgentTurn = await self._agent.ainvoke(
-			message,
-			chat_history=history,
-			context=merged_context or None,
-		)
-		self._history[session_id] = turn.history
+		try:
+			turn: AgentTurn = await self._agent.ainvoke(
+				message,
+				chat_history=history,
+				context=merged_context or None,
+			)
+		except LLMServiceError:
+			history.append(HumanMessage(content=message))
+			fallback_response, fallback_tools, fallback_trace = await self._build_llm_failure_fallback(state, message)
+			if fallback_response:
+				history.append(AIMessage(content=fallback_response))
+			self._history[session_id] = history
+			return {
+				"response": fallback_response,
+				"intent": None,
+				"flow": state.user_role,
+				"classifier_output": None,
+				"tool_calls": fallback_tools,
+				"trace": {
+					"llm_unavailable": True,
+					"fallback": fallback_trace,
+				},
+			}
+		else:
+			self._history[session_id] = turn.history
 
-		return {
-			"response": turn.response,
-			"intent": turn.intent,
-			"flow": turn.flow,
-			"classifier_output": turn.classifier_output,
-			"tool_calls": turn.tool_calls,
-			"trace": turn.trace,
-		}
+			return {
+				"response": turn.response,
+				"intent": turn.intent,
+				"flow": turn.flow,
+				"classifier_output": turn.classifier_output,
+				"tool_calls": turn.tool_calls,
+				"trace": turn.trace,
+			}
 
 	def reset_session(self, session_id: str) -> None:
 		"""Clear stored history for a session."""
@@ -347,3 +372,132 @@ class ChatService:
 			)
 
 		return " ".join(lines)
+
+	async def _build_llm_failure_fallback(
+		self,
+		state: SessionState,
+		message: str,
+	) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+		response = (
+			"I'm having trouble reaching our planner right now. Please try again in a moment."
+		)
+		tool_calls: List[Dict[str, Any]] = []
+		trace: Dict[str, Any] = {
+			"reason": "llm_service_unavailable",
+		}
+		text = (message or "").lower()
+
+		if "order" in text or "buy" in text or "purchase" in text:
+			trace["topic"] = "ordering"
+			if state.user_role == "supplier":
+				response = (
+					"Our planner is offline at the moment, so I can't process supplier orders right now. Please try again shortly."
+				)
+			else:
+				response = (
+					"I'm having trouble reaching our ordering assistant right now, so I can't place that order yet. Please try again in a few minutes."
+				)
+			return response, tool_calls, trace
+
+		if "flash sale" in text:
+			trace["topic"] = "flash_sales"
+			await ensure_db_initialized()
+			filters: Dict[str, Any] = {"status": FlashSaleStatus.ACTIVE}
+			if state.user_role == "supplier" and state.user_id:
+				filters["supplier_id"] = state.user_id
+			try:
+				sales = await FlashSaleRepository.list_flash_sales(filters)
+			except Exception as exc:  # pragma: no cover - defensive fallback
+				logger.exception("Fallback flash sale lookup failed", exc_info=exc)
+				trace["error"] = str(exc)
+				return response, tool_calls, trace
+
+			results: List[Dict[str, Any]] = []
+			for sale in sales:
+				try:
+					await sale.fetch_related("product", "supplier_product")
+				except Exception:  # pragma: no cover - defensive fetch
+					pass
+				product_name = None
+				product_obj = getattr(sale, "product", None)
+				if product_obj is not None:
+					product_name = getattr(product_obj, "product_name_en", None)
+				if not product_name:
+					product_name = getattr(sale, "product_id", None)
+				discount = getattr(sale, "discount_percent", None)
+				if isinstance(discount, (int, float)):
+					discount_value = float(discount)
+				else:
+					try:
+						discount_value = float(discount) if discount is not None else None
+					except (TypeError, ValueError):
+						discount_value = None
+				start_dt = getattr(sale, "start_date", None)
+				end_dt = getattr(sale, "end_date", None)
+				start_iso = self._format_datetime_for_trace(start_dt)
+				end_iso = self._format_datetime_for_trace(end_dt)
+				results.append(
+					{
+						"id": getattr(sale, "id", None),
+						"product": product_name,
+						"discount_percent": discount_value,
+						"start": start_iso,
+						"end": end_iso,
+					}
+				)
+
+			tool_calls.append(
+				{
+					"tool": "fallback.flash_sales",
+					"input": {"filters": filters},
+					"observation": {"count": len(results), "results": results},
+				}
+			)
+
+			if results:
+				summaries: List[str] = []
+				for entry in results[:3]:
+					name = entry.get("product") or "Unnamed product"
+					discount_value = entry.get("discount_percent")
+					end_value = entry.get("end")
+					if discount_value is not None:
+						discount_phrase = f"{discount_value:.0f}% off"
+					else:
+						discount_phrase = "discount available"
+					if end_value:
+						discount_phrase += f" until {end_value}"
+					summaries.append(f"{name} ({discount_phrase})")
+				extra_count = len(results) - len(summaries)
+				if extra_count > 0:
+					suffix = "deal" if extra_count == 1 else "deals"
+					extra_clause = f" plus {extra_count} more {suffix}"
+				else:
+					extra_clause = ""
+				response = (
+					"Our planner is slow right now, but I can confirm these active flash sales: "
+					+ "; ".join(summaries)
+					+ extra_clause
+					+ "."
+				)
+			else:
+				if state.user_role == "supplier":
+					response = (
+						"Our planner is slow right now, but I don't see any active flash sales for your catalog at the moment."
+					)
+				else:
+					response = (
+						"Our planner is slow right now, but I couldn't find any marketplace flash sales happening at the moment."
+					)
+
+		return response, tool_calls, trace
+
+	@staticmethod
+	def _format_datetime_for_trace(value: Any) -> Optional[str]:
+		if isinstance(value, datetime):
+			return value.isoformat()
+		if hasattr(value, "isoformat"):
+			try:
+				return value.isoformat()
+			except Exception:  # pragma: no cover - defensive
+				return str(value)
+		return str(value) if value is not None else None

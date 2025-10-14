@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from app.services.chat_service import ChatService
+from app.services.llm_service import LLMServiceError
 from app.core.rate_limiter import RateLimitStatus, rate_limiter
 
 
@@ -50,6 +51,15 @@ async def chat_endpoint(
 		)
 	except ValidationError as exc:
 		raise HTTPException(status_code=422, detail=exc.errors()) from exc
+	except LLMServiceError as exc:
+		logger.warning(
+			"LLM unavailable for session",
+			extra={
+				"session_id": payload.session_id,
+				"user_message": payload.message,
+			},
+		)
+		raise HTTPException(status_code=503, detail=str(exc)) from exc
 	except Exception as exc:  # pragma: no cover - defensive guard
 		logger.exception(
 			"Chat service failure for session",
