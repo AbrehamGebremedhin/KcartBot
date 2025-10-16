@@ -1117,8 +1117,21 @@ Please provide a clear, helpful answer that addresses the user's question using 
 
         # Handle case where order_items is a string (product name) instead of list
         if isinstance(order_items, str):
-            # Convert string to expected list format
-            order_items = [{"product_name": order_items}]
+            # Try to parse quantity, unit, and product from string like "2 kilo mango"
+            import re
+            match = re.match(r'(\d+(?:\.\d+)?)\s*(kilo|kg|liter|liters?)\s+(.+)', order_items.lower())
+            if match:
+                quantity = float(match.group(1))
+                unit = match.group(2)
+                if unit in ['kilo', 'kg']:
+                    unit = 'kg'
+                elif unit in ['liter', 'liters']:
+                    unit = 'liter'
+                product_name = match.group(3).strip()
+                order_items = [{"product_name": product_name, "quantity": quantity, "unit": unit}]
+            else:
+                # Fallback: treat the whole string as product name
+                order_items = [{"product_name": order_items}]
 
         # Check if we have missing slots that need to be filled
         if missing_slots:
@@ -1132,15 +1145,22 @@ Please provide a clear, helpful answer that addresses the user's question using 
             total_price = 0
             order_details = []
 
+            # Group order items by product to handle multiple quantities of same product
+            product_groups = {}
             for item in order_items:
-                # Handle both dict format and string format
                 if isinstance(item, dict):
                     product_name = item.get("product_name", "")
                     quantity = item.get("quantity", 1)
                 else:
-                    # If item is a string, treat it as product name
                     product_name = str(item)
-                    quantity = 1  # Default quantity
+                    quantity = 1
+
+                if product_name not in product_groups:
+                    product_groups[product_name] = 0
+                product_groups[product_name] += quantity
+
+            # Process each unique product
+            for product_name, total_quantity in product_groups.items():
 
                 # Find the product by any name
                 product = await self.database_tool.run({
@@ -1175,15 +1195,21 @@ Please provide a clear, helpful answer that addresses the user's question using 
 
                 # Use first available supplier for now
                 supplier_product = supplier_products[0]
+                available_quantity = supplier_product.get("quantity_available", 0)
+                
+                if total_quantity > available_quantity:
+                    return f"Sorry, only {available_quantity} {supplier_product.get('unit', 'kg')} of {product_name} is available from the selected supplier."
+                
                 unit_price = supplier_product.get("unit_price_etb", 0)
-                subtotal = quantity * unit_price
+                subtotal = total_quantity * unit_price
                 total_price += subtotal
 
                 order_details.append({
                     "product": supplier_product["product"],
                     "supplier": supplier_product["supplier"],
-                    "quantity": quantity,
+                    "quantity": total_quantity,
                     "unit_price": unit_price,
+                    "unit": supplier_product.get("unit", "kg"),
                     "subtotal": subtotal
                 })
 
@@ -1201,7 +1227,7 @@ Please provide a clear, helpful answer that addresses the user's question using 
                 return "User not found. Please register first."
 
             # Handle delivery date if provided
-            delivery_date = filled_slots.get("delivery_date")
+            delivery_date = filled_slots.get("delivery_date") or filled_slots.get("preferred_delivery_date")
             resolved_delivery_date = None
             if delivery_date:
                 try:
@@ -1259,12 +1285,22 @@ Please provide a clear, helpful answer that addresses the user's question using 
                         "product": product_instance,  # Pass the Product model instance
                         "supplier": supplier_instance,  # Pass the User model instance
                         "quantity": detail["quantity"],
-                        "unit": "kg",  # Assume kg for now
+                        "unit": detail["unit"],
                         "price_per_unit": detail["unit_price"],
                         "subtotal": detail["subtotal"]
                     }
                 })
                 logger.info(f"Order item created successfully")
+
+                # Update supplier inventory
+                new_quantity = available_quantity - detail["quantity"]
+                await self.database_tool.run({
+                    "table": "supplier_products",
+                    "method": "update_supplier_product",
+                    "args": [supplier_product["inventory_id"]],
+                    "kwargs": {"quantity_available": new_quantity}
+                })
+                logger.info(f"Updated supplier inventory: {supplier_product['inventory_id']} now has {new_quantity} {detail['unit']} available")
 
             return f"Order placed successfully! Total: {total_price} ETB. Payment will be Cash on Delivery."
 

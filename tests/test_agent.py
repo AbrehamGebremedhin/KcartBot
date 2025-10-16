@@ -375,15 +375,16 @@ class TestAgent:
         # Mock database calls for order placement
         # 1. find_product_by_any_name, 2. list_supplier_products, 3. get_user_by_id (user instance),
         # 4. create_transaction, 5. get_product_by_id (product instance), 6. get_user_by_id (supplier instance),
-        # 7. create_order_item
+        # 7. create_order_item, 8. update_supplier_product
         mock_database_tool.run.side_effect = [
             {"product_id": 1, "product_name_en": "tomatoes"},  # find_product_by_any_name
-            [{"product": {"product_id": 1}, "supplier": {"user_id": 2}, "unit_price_etb": 25.0}],  # list_supplier_products
+            [{"product": {"product_id": 1}, "supplier": {"user_id": 2}, "unit_price_etb": 25.0, "quantity_available": 10, "unit": "kg", "inventory_id": 1}],  # list_supplier_products
             MagicMock(),  # User model instance
             {"order_id": 100},  # Transaction creation
             MagicMock(),  # Product model instance
             MagicMock(),  # Supplier model instance
-            None  # Order item creation
+            None,  # Order item creation
+            None  # Update supplier product
         ]
 
         session_context = {"user_id": 1}

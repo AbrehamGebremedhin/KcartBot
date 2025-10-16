@@ -113,8 +113,8 @@ INTENT_REGISTRY: Dict[str, IntentDefinition] = {
     "intent.customer.place_order": IntentDefinition(
         flow="customer",
         description="Customer wants to place a new order specifying items and quantities.",
-        required_slots=["order_items"],
-        optional_slots=["preferred_delivery_date", "delivery_date", "supplier_name"],
+        required_slots=["order_items", "preferred_delivery_date"],
+        optional_slots=["delivery_date", "supplier_name"],
         suggested_tools=["database_access"],
     ),
     "intent.customer.set_delivery_date": IntentDefinition(
@@ -319,6 +319,10 @@ IMPORTANT: If the user says something like "okay", "yes", "sure", "go ahead", "s
 
 Each intent belongs to exactly one flow (customer or supplier) and is described below:
 {INTENT_CATALOG_TEXT}
+
+For intent.customer.place_order, parse order details from the user's message and fill order_items as a list of objects with product_name, quantity, and unit. For example:
+- "I want 2 kg mango" → {{"order_items": [{{"product_name": "mango", "quantity": 2, "unit": "kg"}}]}}
+- "Order 5 liters milk and 3 kg tomatoes" → {{"order_items": [{{"product_name": "milk", "quantity": 5, "unit": "liter"}}, {{"product_name": "tomatoes", "quantity": 3, "unit": "kg"}}]}}
 
 Return a compact JSON object with the following keys:
 - intent: the best matching intent string from the catalog. Choose the most specific option.
