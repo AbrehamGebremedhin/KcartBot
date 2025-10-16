@@ -4,43 +4,9 @@ Conversational commerce copilot that helps customers shop smarter and suppliers 
 
 ## Architecture
 
-```
-User (web / chat client)
-		  │   HTTP (JSON)
-		  ▼
-┌──────────────────────┐
-│ FastAPI `/api/v1`    │  Rate-limited REST edge
-└──────────┬───────────┘
-			  │ calls
-			  ▼
-┌──────────────────────┐
-│ ChatService          │  Session state, login flow, context
-└──────────┬───────────┘
-			  │ ainvoke
-			  ▼
-┌──────────────────────┐
-│ LangChain Agent      │  Gemini LLM + tool calling
-└┬───────┬───────┬─────┘
- │       │       │
- │       │       └──────────────┐
- │       │                      ▼
- │       │              ┌────────────────┐
- │       │              │ Image Tool     │→ Gemini Image API (marketing visuals)
- │       │
- │       └──────────────┐
- │                      ▼
- │              ┌────────────────┐
- │              │ FlashSaleTool  │→ PostgreSQL flash_sale tables
- │
- └──────────────┐
-					 ▼
-		  ┌──────────────┬───────────────┐
-		  │ VectorSearch │ Data/Analytics │
-		  │ Tool         │ Tools          │
-		  └──────┬───────┴──────┬────────┘
-					│              │
-		Milvus (RAG)    PostgreSQL via Tortoise ORM
-```
+![KcartBot architecture diagram](architecture.png)
+
+_Figure: KcartBot system architecture — FastAPI edge, LangChain agent + Gemini LLM, Milvus RAG, PostgreSQL operational store, and typed tool adapters._
 
 Why this layout?
 
@@ -48,6 +14,37 @@ Why this layout?
 - **Milvus RAG layer** grounds advisory answers (product education, policy reminders) with curated PDF knowledge, avoiding hallucinations.
 - **PostgreSQL OLTP store** models transactions, suppliers, inventory, and pricing history so supplier and customer actions mutate durable records.
 - **Tools as thin, typed adapters** (analytics, flash sales, vector search, image generation) isolate external systems, making it simple to swap implementations (e.g., different vector DB or BI backend) later.
+
+## Data Flow
+
+The system processes user interactions through a structured data flow designed for conversational commerce:
+
+1. **User Interaction**: Users send messages via HTTP POST requests to `/api/v1/chat`, including a `session_id` and `message` payload.
+
+2. **API Gateway**: FastAPI serves as the rate-limited REST edge, validating requests and routing them to the ChatService.
+
+3. **Session Management**: ChatService handles session state, user authentication flows, and maintains conversational context across interactions.
+
+4. **Agent Orchestration**: ChatService asynchronously invokes the LangChain Agent, which uses the DeepSeek LLM for intent classification and reasoning.
+
+5. **Tool Execution**: The Agent calls specialized tools based on user intent:
+
+   - **Image Generation**: Image Tool invokes Gemini API to create marketing visuals, saving outputs to `data/images/`.
+   - **Flash Sales**: FlashSaleTool interacts with PostgreSQL flash_sale tables for proposals and updates.
+   - **Knowledge Retrieval**: VectorSearch Tool queries Milvus for RAG-based answers from embedded knowledge.
+   - **Analytics & Data**: Data/Analytics Tools perform queries on PostgreSQL via Tortoise ORM for pricing, inventory, and competitor data.
+
+6. **Response Synthesis**: The Agent combines tool outputs with LLM-generated responses to provide coherent, context-aware replies.
+
+7. **Data Persistence**:
+
+   - Operational data (users, products, transactions, inventory) is stored in PostgreSQL.
+   - Vector embeddings for RAG are maintained in Milvus.
+   - Session state is managed in-memory (consider Redis for scalability).
+
+8. **Response Delivery**: Final responses are streamed back through the API to the user client.
+
+This flow ensures secure, efficient handling of conversational commerce tasks while isolating concerns across layers.
 
 ## Prerequisites
 

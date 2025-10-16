@@ -9,9 +9,6 @@ wheels/
 # Virtual environments
 .venv
 
-# Data files
-data/
-
 # Tortoise ORM migrations
 migrations/
 
