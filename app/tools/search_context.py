@@ -241,10 +241,37 @@ class VectorSearchTool(ToolBase):
                 source_value = "unknown"
                 chunk_index_value = -1
 
-                if isinstance(entity, dict):
-                    text_value = entity.get("text", "")
-                    source_value = entity.get("source", "unknown")
-                    chunk_index_value = entity.get("chunk_index", -1)
+                # First check if hit is a dict and has entity field (nested structure)
+                if isinstance(hit, dict) and "entity" in hit:
+                    entity = hit["entity"]
+                    
+                    # Handle pymilvus Hit objects
+                    if hasattr(entity, 'entity') and hasattr(entity, 'to_dict'):
+                        # This is a pymilvus Hit object with nested entity
+                        try:
+                            entity_dict = entity.to_dict()
+                            inner_entity = entity_dict.get("entity", {})
+                            if isinstance(inner_entity, dict):
+                                text_value = inner_entity.get("text", "")
+                                source_value = inner_entity.get("source", "unknown")
+                                chunk_index_value = inner_entity.get("chunk_index", -1)
+                        except Exception as e:
+                            logger.debug(f"Error parsing Hit object: {e}")
+                    
+                    elif isinstance(entity, dict):
+                        # Check for nested entity structure (Milvus returns nested entities)
+                        inner_entity = entity.get("entity")
+                        if isinstance(inner_entity, dict):
+                            # Use the inner entity which contains the actual data
+                            text_value = inner_entity.get("text", "")
+                            source_value = inner_entity.get("source", "unknown")
+                            chunk_index_value = inner_entity.get("chunk_index", -1)
+                        else:
+                            # Fallback to direct entity access
+                            text_value = entity.get("text", "")
+                            source_value = entity.get("source", "unknown")
+                            chunk_index_value = entity.get("chunk_index", -1)
+                # Fallback: check if hit itself has the fields
                 elif isinstance(hit, dict):
                     text_value = hit.get("text", "")
                     source_value = hit.get("source", "unknown")

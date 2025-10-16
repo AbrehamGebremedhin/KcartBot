@@ -1,1139 +1,2268 @@
-"""LangChain-based asynchronous conversational agent for KCartBot."""
+"""KCartBot Agent - Orchestrates LLM and tools for customer/supplier conversations."""
 
 from __future__ import annotations
 
-import asyncio
-import copy
+import datetime
 import json
-import re
-from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
-from datetime import date
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
-
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain.agents.output_parsers import ReActSingleInputOutputParser
-from langchain_core.agents import AgentAction, AgentFinish
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import (
-	AIMessage,
-	BaseMessage,
-	HumanMessage,
-	SystemMessage,
-)
-from langchain_core.outputs import ChatGeneration, ChatResult
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.tools import BaseTool
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.llm_service import LLMService
-from app.tools import (
-	AnalyticsDataTool,
-	DataAccessTool,
-	FlashSaleTool,
-	ImageGeneratorTool,
-	IntentClassifierTool,
-	VectorSearchTool,
-	ScheduleTool,
-)
-from app.tools.intent_classifier import CLASSIFIER_SYSTEM_PROMPT
-from app.tools.base import ToolBase
+from app.tools.database_tool import DatabaseAccessTool
+from app.tools.date_tool import DateResolverTool
+from app.tools.generate_image import ImageGeneratorTool
+from app.tools.intent_classifier import IntentClassifierTool
+from app.tools.search_context import VectorSearchTool
+
+logger = logging.getLogger(__name__)
 
 
-AGENT_SYSTEM_PROMPT = """
-You are the orchestration layer for KCartBot. Coordinate between customers and suppliers by:
-1. Calling the `intent_classifier` tool FIRST for every new user input.
-2. Using conversation history to understand context - if user says "okay", "yes", "sure" etc., treat it as confirmation of the previous assistant message.
-3. Choosing downstream tools (`vector_search`, `data_access`, `analytics_data`, `flash_sale_manager`, `image_generator`) based on the intent outcome.
-4. Synthesising concise, friendly replies (1-3 sentences) that confirm critical information.
-5. Format every reply as a single line with no newline characters; join sentences into one paragraph.
+class Agent:
+    """Main agent that orchestrates LLM and tools for KCartBot conversations."""
 
-Guidelines:
-- Customer flow: support onboarding, advisory (using retrieved context), ordering, logistics, and payment confirmation.
-- Supplier flow: support onboarding, inventory management, scheduling, pricing insights, flash sale decisions, handling/storage guidance, and imagery.
-- During supplier inventory intake, gather product name, quantity, price per unit, expiry date, and available delivery days. Infer category when obvious (e.g., tomatoes → vegetable) instead of asking the user to supply it explicitly. If expiry date or delivery schedule is missing, ask for it explicitly, accepting natural phrases like "all week", "weekends", or "next week" and convert them to specific availability before calling tools.
- - During supplier inventory intake, gather product name, quantity, price per unit, expiry date, and available delivery days. Ask for one missing detail at a time (e.g., request the expiry date, wait for the reply, then ask about delivery days). Infer category when obvious (e.g., tomatoes → vegetable) instead of asking the user to supply it explicitly. If expiry date or delivery schedule is missing, ask for it explicitly, accepting natural phrases like "all week", "weekends", or "next week" and convert them to specific availability before calling tools. When a schedule or expiry phrase is resolved, reuse that observation instead of re-calling `schedule_helper`.
-- Currency handling: the marketplace operates in Ethiopian Birr (ETB). Present all monetary amounts in ETB, treat user mentions of other currencies as informational only, and ask for or perform ETB conversion rather than switching currencies.
-- Units: Solid goods are tracked per kilogram (kg) and liquids per liter (liter). Keep conversations and inventory updates in those units unless converting between them for clarity.
-- Language support: Detect and comfortably engage in English, Amharic (Ge'ez script), and phonetic Amharic (Latin script). Default to English responses unless the user's latest message is entirely Amharic or phonetic Amharic, in which case reply in Amharic (optionally adding a concise English gloss if it aids clarity). Confirm before switching languages mid-conversation.
-- Product name handling: Catalog entries carry English, Amharic, and phonetic Amharic variants. When matching user inputs (including minor spelling mistakes) to products or quoting names back, search across all variants, normalise simple misspellings, and respond using the language variant that matches the conversation.
-- Treat structured data as primary: for pricing, inventory, sales history, or comparisons, call `data_access` or `analytics_data` first (e.g. fetch competitor prices for "best price" style questions). Only fall back to `vector_search` if the answer clearly depends on documentation or knowledge base snippets.
-- Use `vector_search` for documentation or policy lookups when structured data is insufficient.
-- When a supplier asks how to store, preserve, or handle a product, respond with storage guidance drawn from retrieved context or well-known best practices unless they explicitly request stock levels or status updates.
-- When a tool returns a valid result, incorporate it into the reply rather than calling the same tool repeatedly unless new parameters are supplied.
-- Call `intent_classifier` exactly once per user turn; reuse its output for the remainder of the turn. If the classifier reports missing slots (e.g. `product_name`), ask the user to provide them instead of re-calling the classifier.
-- When planning pricing insights, always include a concrete `product_name` (or `product_id`) for analytics calls. Reuse the exact spelling from inventory records when known, and normalise simple plural/singular variants (e.g. "tomatoes" → "Tomato"). If no product is specified, consult the supplier's inventory or ask the user to choose one before calling pricing tools.
-- Use `schedule_helper` to convert natural-language delivery schedules or relative expiry phrases ("next week", "this weekend") into normalized schedules or concrete dates before updating inventory or flash sales.
-- Before calling `data_access` to create or update supplier inventory pricing, query `analytics_data` with `operation: "pricing_guidance"` for that product and share the competitor/historical recommendation so the supplier can confirm or adjust their price.
-- When user confirms with "okay", "yes", "sure" etc., look at conversation history to understand what they're confirming and proceed accordingly.
-- Always reflect missing slots back to the user to gather required details.
-- Confirm actions (orders, price changes, flash sales) before finalising.
-- Use `flash_sale_manager` to surface proposals, accept, or decline flash sale offers.
-- Mention next logical step when helpful, but avoid overwhelming lists.
-- If the classifier returns `intent.unknown` AND there's no clear context from history, ask the user for clarification.
+    def __init__(self) -> None:
+        """Initialize the agent with all required tools and services."""
+        self.llm_service = LLMService()
+        self.intent_classifier = IntentClassifierTool()  # Create its own LLM service instance
+        self.database_tool = DatabaseAccessTool()
+        self.vector_search = VectorSearchTool()
+        self.date_resolver = DateResolverTool(llm_service=self.llm_service)
+        self.image_generator = ImageGeneratorTool()
 
-Session context (if any) is provided as JSON to keep track of active orders, user type, or preferences. Incorporate it when deciding what to do next.
+        # Tool registry for dynamic access
+        self.tools = {
+            "intent_classifier": self.intent_classifier,
+            "database_access": self.database_tool,
+            "vector_search": self.vector_search,
+            "date_resolver": self.date_resolver,
+            "image_generator": self.image_generator,
+        }
+
+    async def process_message(
+        self,
+        user_message: str,
+        session_context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Process a user message and return a response.
+
+        Args:
+            user_message: The user's input message
+            session_context: Session context including chat history, user info, etc.
+
+        Returns:
+            Dict containing response and updated context
+        """
+        try:
+            # Initialize context if not provided
+            if session_context is None:
+                session_context = {}
+
+            # Extract chat history
+            chat_history = session_context.get("chat_history", [])
+
+            # Step 1: Classify intent
+            intent_result = await self.intent_classifier.run(
+                {"text": user_message},
+                context={"chat_history": chat_history}
+            )
+
+            intent = intent_result.get("intent", "intent.unknown")
+            flow = intent_result.get("flow", "unknown")
+            filled_slots = intent_result.get("filled_slots", {})
+            missing_slots = intent_result.get("missing_slots", [])
+            suggested_tools = intent_result.get("suggested_tools", [])
+
+            logger.info(f"Classified intent: {intent}, flow: {flow}, missing_slots: {missing_slots}")
+
+            # Update session context with current intent and flow
+            session_context.update({
+                "current_intent": intent,
+                "current_flow": flow,
+                "filled_slots": filled_slots,
+                "missing_slots": missing_slots,
+                "last_user_message": user_message,  # Store the original user message
+            })
+
+            # Step 2: Handle the conversation based on flow and intent
+            if flow == "unknown" or intent == "intent.unknown":
+                response = await self._handle_unknown_intent(user_message, chat_history)
+            elif flow == "customer":
+                response = await self._handle_customer_flow(
+                    intent, filled_slots, missing_slots, suggested_tools, session_context
+                )
+            elif flow == "supplier":
+                response = await self._handle_supplier_flow(
+                    intent, filled_slots, missing_slots, suggested_tools, session_context
+                )
+            elif flow == "onboarding":
+                response = await self._handle_onboarding_flow(
+                    intent, filled_slots, missing_slots, suggested_tools, session_context
+                )
+            else:
+                response = "I'm sorry, I couldn't understand your request. Could you please clarify?"
+
+            # Step 3: Update chat history
+            chat_history.append({"role": "user", "content": user_message})
+            chat_history.append({"role": "assistant", "content": response})
+
+            # Keep only last 10 exchanges to avoid token overflow
+            if len(chat_history) > 20:
+                chat_history = chat_history[-20:]
+
+            session_context["chat_history"] = chat_history
+
+            return {
+                "response": response,
+                "session_context": session_context,
+                "intent_info": {
+                    "intent": intent,
+                    "flow": flow,
+                    "filled_slots": filled_slots,
+                    "missing_slots": missing_slots,
+                }
+            }
+
+        except Exception as exc:
+            logger.error(f"Error processing message: {exc}")
+            return {
+                "response": "I'm sorry, I encountered an error. Please try again.",
+                "session_context": session_context or {},
+                "error": str(exc)
+            }
+
+    async def _handle_unknown_intent(
+        self, user_message: str, chat_history: List[Dict[str, str]]
+    ) -> str:
+        """Handle unknown intents by asking for clarification."""
+        # Check for simple greetings
+        greeting_words = ["hello", "hi", "hey", "good morning", "good afternoon", "good evening", "greetings"]
+        if any(word in user_message.lower() for word in greeting_words):
+            return "Hello! Welcome to KCartBot, your fresh produce marketplace assistant. Are you a customer looking to place an order, or a supplier managing inventory?"
+
+        # Check if this might be a confirmation of previous context
+        if chat_history:
+            last_assistant_msg = None
+            for msg in reversed(chat_history):
+                if msg.get("role") == "assistant":
+                    last_assistant_msg = msg.get("content", "")
+                    break
+
+            if any(word in user_message.lower() for word in ["yes", "okay", "sure", "go ahead", "confirm"]):
+                return "Great! Could you please provide more details about what you'd like to do?"
+
+    async def _handle_unknown_intent(
+        self, user_message: str, chat_history: List[Dict[str, str]]
+    ) -> str:
+        """Handle unknown intents by asking for clarification."""
+        # Check for simple greetings
+        greeting_words = ["hello", "hi", "hey", "good morning", "good afternoon", "good evening", "greetings"]
+        if any(word in user_message.lower() for word in greeting_words):
+            return "Hello! Welcome to KCartBot, your fresh produce marketplace assistant. Are you a customer looking to place an order, or a supplier managing inventory?"
+
+        # Check if this might be a confirmation of previous context
+        if chat_history:
+            last_assistant_msg = None
+            for msg in reversed(chat_history):
+                if msg.get("role") == "assistant":
+                    last_assistant_msg = msg.get("content", "")
+                    break
+
+            if any(word in user_message.lower() for word in ["yes", "okay", "sure", "go ahead", "confirm"]):
+                return "Great! Could you please provide more details about what you'd like to do?"
+
+        return "I'm not sure what you mean. Are you a customer looking to place an order, or a supplier managing inventory?"
+
+    async def _handle_customer_flow(
+        self,
+        intent: str,
+        filled_slots: Dict[str, Any],
+        missing_slots: List[str],
+        suggested_tools: List[str],
+        session_context: Dict[str, Any]
+    ) -> str:
+        """Handle customer flow intents."""
+        try:
+            if intent == "intent.customer.register":
+                return await self._handle_customer_registration(filled_slots, missing_slots, session_context)
+
+            elif intent == "intent.customer.check_availability":
+                return await self._handle_product_availability(filled_slots, session_context)
+
+            elif intent == "intent.customer.storage_advice":
+                return await self._handle_storage_advice(filled_slots, session_context)
+
+            elif intent == "intent.customer.nutrition_query":
+                return await self._handle_nutrition_query(filled_slots, session_context)
+
+            elif intent == "intent.customer.seasonal_query":
+                return await self._handle_seasonal_query(filled_slots, session_context)
+
+            elif intent == "intent.customer.what_is_in_season":
+                return await self._handle_in_season_query(filled_slots, session_context)
+
+            elif intent == "intent.customer.general_advisory":
+                return await self._handle_general_advisory(filled_slots, session_context)
+
+            elif intent == "intent.customer.place_order":
+                return await self._handle_place_order(filled_slots, missing_slots, session_context)
+
+            elif intent == "intent.customer.set_delivery_date":
+                return await self._handle_set_delivery_date(filled_slots, session_context)
+
+            elif intent == "intent.customer.set_delivery_location":
+                return await self._handle_set_delivery_location(filled_slots, session_context)
+
+            elif intent == "intent.customer.confirm_payment":
+                return await self._handle_confirm_payment(filled_slots, session_context)
+
+            elif intent == "intent.customer.check_deliveries":
+                return await self._handle_customer_check_deliveries(filled_slots, session_context)
+
+            else:
+                return "I'm here to help with your fresh produce needs. What would you like to do?"
+
+        except Exception as exc:
+            logger.error(f"Error in customer flow: {exc}")
+            return "I encountered an issue processing your request. Please try again."
+
+    async def _handle_supplier_flow(
+        self,
+        intent: str,
+        filled_slots: Dict[str, Any],
+        missing_slots: List[str],
+        suggested_tools: List[str],
+        session_context: Dict[str, Any]
+    ) -> str:
+        """Handle supplier flow intents."""
+        try:
+            if intent == "intent.supplier.register":
+                return await self._handle_supplier_registration(filled_slots, missing_slots, session_context)
+
+            elif intent == "intent.supplier.add_product":
+                return await self._handle_add_product(filled_slots, missing_slots, session_context)
+
+            elif intent == "intent.supplier.set_quantity":
+                return await self._handle_set_quantity(filled_slots, session_context)
+
+            elif intent == "intent.supplier.update_inventory":
+                return await self._handle_update_inventory(filled_slots, session_context)
+
+            elif intent == "intent.supplier.set_delivery_dates":
+                return await self._handle_set_delivery_dates(filled_slots, session_context)
+
+            elif intent == "intent.supplier.set_expiry_date":
+                return await self._handle_set_expiry_date(filled_slots, session_context)
+
+            elif intent == "intent.supplier.set_price":
+                return await self._handle_set_price(filled_slots, session_context)
+
+            elif intent == "intent.supplier.request_pricing_insight":
+                return await self._handle_pricing_insight(filled_slots, session_context)
+
+            elif intent == "intent.supplier.generate_product_image":
+                return await self._handle_generate_image(filled_slots, session_context)
+
+            elif intent == "intent.supplier.check_deliveries":
+                return await self._handle_supplier_check_deliveries(filled_slots, session_context)
+
+            elif intent == "intent.supplier.check_stock":
+                return await self._handle_check_stock(session_context)
+
+            elif intent == "intent.supplier.view_expiring_products":
+                return await self._handle_view_expiring_products(filled_slots, session_context)
+
+            elif intent == "intent.supplier.accept_flash_sale":
+                return await self._handle_accept_flash_sale(filled_slots, session_context)
+
+            elif intent == "intent.supplier.decline_flash_sale":
+                return await self._handle_decline_flash_sale(filled_slots, session_context)
+
+            elif intent == "intent.supplier.view_delivery_schedule":
+                return await self._handle_view_delivery_schedule(filled_slots, session_context)
+
+            elif intent == "intent.supplier.check_deliveries_by_date":
+                return await self._handle_check_deliveries_by_date(filled_slots, session_context)
+
+            elif intent == "intent.supplier.add_to_existing":
+                return await self._handle_add_to_existing(session_context)
+
+            elif intent == "intent.supplier.create_new_listing":
+                return await self._handle_create_new_listing(session_context)
+
+            elif intent == "intent.customer.nutrition_query":
+                return await self._handle_nutrition_query(filled_slots, session_context)
+
+            else:
+                return "I'm here to help you manage your inventory and sales. What would you like to do?"
+
+        except Exception as exc:
+            logger.error(f"Error in supplier flow: {exc}")
+            return "I encountered an issue processing your request. Please try again."
+
+    async def _handle_onboarding_flow(
+        self,
+        intent: str,
+        filled_slots: Dict[str, Any],
+        missing_slots: List[str],
+        suggested_tools: List[str],
+        session_context: Dict[str, Any]
+    ) -> str:
+        """Handle user onboarding flow."""
+        try:
+            if intent == "intent.user.is_customer":
+                session_context["user_role"] = "customer"
+                return "Great! Are you a new customer or do you already have an account with us?"
+
+            elif intent == "intent.user.is_supplier":
+                session_context["user_role"] = "supplier"
+                return "Excellent! Are you a new supplier or do you already have an account with us?"
+
+            elif intent == "intent.user.has_account":
+                user_role = session_context.get("user_role")
+                if not user_role:
+                    return "Please tell me if you're a customer or supplier first."
+
+                return f"I see you already have an account. What's your name and phone number so I can verify your {user_role} account?"
+
+            elif intent == "intent.user.new_user":
+                return await self._handle_new_user_registration(filled_slots, session_context)
+
+            elif intent == "intent.user.verify_account":
+                return await self._handle_account_verification(filled_slots, session_context)
+
+            else:
+                return "I'm not sure about that. Are you a customer or supplier?"
+
+        except Exception as exc:
+            logger.error(f"Error in onboarding flow: {exc}")
+            return "I encountered an issue during onboarding. Please try again."
+
+    # Onboarding flow handlers
+    async def _handle_account_verification(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle verification of existing user account."""
+        user_name = filled_slots.get("user_name")
+        phone_number = filled_slots.get("phone_number")
+        user_role = session_context.get("user_role")
+
+        if not user_name or not phone_number:
+            return "I need both your name and phone number to verify your account."
+
+        try:
+            # Check if user exists in database
+            result = await self.database_tool.run({
+                "table": "users",
+                "method": "list_users",
+                "args": [],
+                "kwargs": {"filters": {"name__icontains": user_name, "phone": phone_number, "role": user_role}}
+            })
+
+            if result and len(result) > 0:
+                user = result[0]
+                session_context["user_id"] = user["user_id"]
+                session_context["authenticated"] = True
+
+                if user_role == "customer":
+                    return f"Welcome back, {user_name}! Your customer account has been verified. How can I help you with your fresh produce needs today?"
+                else:
+                    # Supplier dashboard - show pending orders and expiring products
+                    dashboard_info = await self._get_supplier_dashboard_info(user["user_id"])
+                    return f"Welcome back, {user_name}! Your supplier account has been verified. {dashboard_info} How can I help you manage your inventory today?"
+            else:
+                return f"I couldn't find an account with that name and phone number. Would you like to create a new {user_role} account instead?"
+
+        except Exception as exc:
+            logger.error(f"Failed to verify account: {exc}")
+            return "I couldn't verify your account right now. Please try again."
+
+    async def _get_supplier_dashboard_info(self, supplier_id: int) -> str:
+        """Get dashboard information for supplier login."""
+        try:
+            dashboard_parts = []
+
+            # Get pending orders
+            pending_orders = await self._get_supplier_pending_orders(supplier_id)
+            if pending_orders:
+                dashboard_parts.append(pending_orders)
+
+            # Get expiring products and flash sale suggestions
+            expiring_info = await self._get_supplier_expiring_products_and_suggestions(supplier_id)
+            if expiring_info:
+                dashboard_parts.append(expiring_info)
+
+            if not dashboard_parts:
+                return "You have no pending orders or expiring products at this time."
+
+            return " ".join(dashboard_parts)
+
+        except Exception as exc:
+            logger.error(f"Failed to get supplier dashboard info: {exc}")
+            return "I couldn't load your dashboard information right now."
+
+    async def _get_supplier_pending_orders(self, supplier_id: int) -> str:
+        """Get pending orders for a supplier."""
+        try:
+            # Query order items for this supplier
+            order_items = await self.database_tool.run({
+                "table": "order_items",
+                "method": "list_order_items",
+                "args": [],
+                "kwargs": {"filters": {"supplier": supplier_id}}
+            })
+
+            if not order_items:
+                return ""
+
+            # Filter for pending/confirmed orders
+            pending_orders = []
+            for item in order_items:
+                # Get the transaction for this order item
+                transaction = await self.database_tool.run({
+                    "table": "transactions",
+                    "method": "get_transaction_by_id",
+                    "args": [item["order"]["order_id"]],
+                    "kwargs": {}
+                })
+
+                if transaction and transaction.get("status") in ["Pending", "Confirmed"]:
+                    pending_orders.append({
+                        "order_id": transaction["order_id"],
+                        "customer": transaction.get("user", "Unknown customer"),
+                        "product": item.get("product", "Unknown product"),
+                        "quantity": item.get("quantity", 0),
+                        "unit": item.get("unit", "kg"),
+                        "delivery_date": transaction.get("delivery_date"),
+                        "status": transaction.get("status", "Unknown")
+                    })
+
+            if not pending_orders:
+                return ""
+
+            # Format the response as a single line paragraph
+            order_descriptions = []
+            for order in pending_orders[:5]:  # Show up to 5 orders
+                product_name = "Unknown product"
+                if isinstance(order["product"], dict):
+                    product_name = order["product"].get("product_name_en", "Unknown product")
+
+                customer_name = "Unknown customer"
+                if isinstance(order["customer"], dict):
+                    customer_name = order["customer"].get("name", "Unknown customer")
+
+                customer_location = "Unknown location"
+                if isinstance(order["customer"], dict):
+                    customer_location = order["customer"].get("default_location", "Unknown location")
+
+                delivery_info = ""
+                if order["delivery_date"]:
+                    try:
+                        from datetime import datetime
+                        if isinstance(order["delivery_date"], str):
+                            if 'T' in order["delivery_date"]:
+                                delivery_date = order["delivery_date"].split('T')[0]
+                            else:
+                                delivery_date = order["delivery_date"]
+                            date_obj = datetime.fromisoformat(delivery_date.replace('Z', '+00:00'))
+                            delivery_info = f" - Delivery: {date_obj.strftime('%b %d')}"
+                    except:
+                        delivery_info = f" - Delivery: {order['delivery_date']}"
+
+                order_descriptions.append(
+                    f"Order {str(order['order_id'])[:8]}...: {product_name} "
+                    f"({order['quantity']} {order['unit']}) for {customer_name} in {customer_location}{delivery_info} - {order['status']}"
+                )
+
+            if len(pending_orders) > 5:
+                order_descriptions.append(f"and {len(pending_orders) - 5} more pending orders")
+
+            return "📦 **Pending Orders:** " + ", ".join(order_descriptions) + "."
+
+        except Exception as exc:
+            logger.error(f"Failed to get supplier pending orders: {exc}")
+            return ""
+
+    async def _get_supplier_expiring_products_and_suggestions(self, supplier_id: int) -> str:
+        """Get expiring products and flash sale suggestions for a supplier."""
+        try:
+            # Get expiring products (within 7 days)
+            expiring_products = await self.database_tool.run({
+                "table": "supplier_products",
+                "method": "get_expiring_products",
+                "args": [supplier_id, 7],
+                "kwargs": {}
+            })
+
+            if not expiring_products:
+                return ""
+
+            # Generate flash sale suggestions
+            await self.database_tool.run({
+                "table": "supplier_products",
+                "method": "generate_flash_sale_proposals",
+                "args": [supplier_id],
+                "kwargs": {"within_days": 7, "default_discount": 25.0}
+            })
+
+            # Get proposed flash sales
+            proposed_sales = await self.database_tool.run({
+                "table": "flash_sales",
+                "method": "list_flash_sales",
+                "args": [],
+                "kwargs": {"filters": {"supplier": supplier_id, "status": "proposed"}}
+            })
+
+            # Format the response
+            response_parts = ["⚠️ **Expiring Products (next 7 days):**"]
+
+            for product in expiring_products[:5]:  # Show up to 5 products
+                product_name = "Unknown product"
+                if isinstance(product.get("product"), dict):
+                    product_name = product["product"].get("product_name_en", "Unknown product")
+
+                expiry_date = product.get("expiry_date")
+                expiry_info = "Unknown expiry"
+                if expiry_date:
+                    try:
+                        from datetime import datetime
+                        if isinstance(expiry_date, str):
+                            date_obj = datetime.fromisoformat(expiry_date.replace('Z', '+00:00'))
+                            expiry_info = date_obj.strftime('%b %d')
+                        else:
+                            expiry_info = str(expiry_date)
+                    except:
+                        expiry_info = str(expiry_date)
+
+                quantity = product.get("quantity_available", 0)
+                unit = product.get("unit", "kg")
+
+                response_parts.append(
+                    f"• {product_name}: {quantity} {unit} expires {expiry_info}"
+                )
+
+            if len(expiring_products) > 5:
+                response_parts.append(f"... and {len(expiring_products) - 5} more expiring products.")
+
+            # Add flash sale suggestions
+            if proposed_sales:
+                response_parts.append("💡 **Flash Sale Suggestions:**")
+                response_parts.append("I've created flash sale proposals for your expiring products with 25% discount.")
+                response_parts.append("You can accept these to attract customers and reduce waste.")
+
+                for sale in proposed_sales[:3]:  # Show up to 3 suggestions
+                    product_name = "Unknown product"
+                    if isinstance(sale.get("product"), dict):
+                        product_name = sale["product"].get("product_name_en", "Unknown product")
+
+                    discount = sale.get("discount_percent", 0)
+                    response_parts.append(f"• {product_name}: {discount}% off until expiry")
+
+            return " ".join(response_parts)
+
+        except Exception as exc:
+            logger.error(f"Failed to get supplier expiring products: {exc}")
+            return ""
+
+    async def _handle_new_user_registration(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle registration of new user."""
+        user_role = session_context.get("user_role")
+        if not user_role:
+            return "Please tell me if you're a customer or supplier first."
+
+        if user_role == "customer":
+            user_name = filled_slots.get("customer_name")
+            phone_number = filled_slots.get("phone_number")
+            default_location = filled_slots.get("default_location")
+
+            if not user_name:
+                return "What's your name?"
+            if not phone_number:
+                return "What's your phone number?"
+            if not default_location:
+                return "What's your default delivery location?"
+
+            try:
+                result = await self.database_tool.run({
+                    "table": "users",
+                    "method": "create_user",
+                    "args": [],
+                    "kwargs": {
+                        "name": user_name,
+                        "phone": phone_number,
+                        "default_location": default_location,
+                        "preferred_language": "English",  # Default language
+                        "role": "customer",
+                        "joined_date": datetime.date.today()  # Explicitly set joined date
+                    }
+                })
+                session_context["user_id"] = result.get("user_id")
+                session_context["authenticated"] = True
+                return f"Welcome {user_name}! Your customer account has been created. How can I help you with your fresh produce needs today?"
+
+            except Exception as exc:
+                logger.error(f"Failed to register customer: {exc}")
+                return "I couldn't create your account. Please try again."
+
+        else:  # supplier
+            supplier_name = filled_slots.get("supplier_name")
+            phone_number = filled_slots.get("phone_number")
+
+            if not supplier_name:
+                return "What's your business name?"
+            if not phone_number:
+                return "What's your phone number?"
+
+            try:
+                result = await self.database_tool.run({
+                    "table": "users",
+                    "method": "create_user",
+                    "args": [],
+                    "kwargs": {
+                        "name": supplier_name,
+                        "phone": phone_number,
+                        "default_location": "",  # Suppliers don't need a default location
+                        "preferred_language": "English",  # Default language
+                        "role": "supplier",
+                        "joined_date": datetime.date.today()  # Explicitly set joined date
+                    }
+                })
+                session_context["user_id"] = result.get("user_id")
+                session_context["authenticated"] = True
+                return f"Welcome {supplier_name}! Your supplier account has been created. How can I help you manage your inventory today?"
+
+            except Exception as exc:
+                logger.error(f"Failed to register supplier: {exc}")
+                return "I couldn't create your account. Please try again."
+
+    # Customer flow handlers
+    async def _handle_customer_registration(
+        self, filled_slots: Dict[str, Any], missing_slots: List[str], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle customer registration."""
+        if missing_slots:
+            slot = missing_slots[0]
+            if slot == "customer_name":
+                return "Welcome! What's your name?"
+            elif slot == "phone_number":
+                return "Great! What's your phone number?"
+            elif slot == "default_location":
+                return "Perfect! What's your default delivery location?"
+
+        # All slots filled, register the customer
+        try:
+            result = await self.database_tool.run({
+                "table": "users",
+                "method": "create_user",
+                "args": [],
+                "kwargs": {
+                    "name": filled_slots["customer_name"],
+                    "phone": filled_slots["phone_number"],
+                    "default_location": filled_slots["default_location"],
+                    "preferred_language": "English",  # Default language
+                    "role": "customer",
+                    "joined_date": datetime.date.today()  # Explicitly set joined date
+                }
+            })
+            session_context["user_id"] = result.get("user_id")
+            return f"Welcome {filled_slots['customer_name']}! Your account has been created. How can I help you today?"
+        except Exception as exc:
+            logger.error(f"Failed to register customer: {exc}")
+            return "I couldn't create your account. Please try again."
+
+    async def _handle_product_availability(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Check product availability."""
+        product_name = filled_slots.get("product_name")
+        if not product_name:
+            return "What product are you looking for?"
+
+        try:
+            # First, try to find the product by name
+            product = await self.database_tool.run({
+                "table": "products",
+                "method": "find_product_by_any_name",
+                "args": [product_name],
+                "kwargs": {}
+            })
+
+            if product:
+                # Product found - show availability from suppliers
+                result = await self.database_tool.run({
+                    "table": "supplier_products",
+                    "method": "list_supplier_products",
+                    "args": [],
+                    "kwargs": {"filters": {"product": product["product_id"]}}
+                })
+
+                available_products = []
+                for item in result:
+                    if item.get("quantity_available", 0) > 0:
+                        available_products.append(item)
+
+                if not available_products:
+                    return f"Sorry, {product_name} is currently out of stock."
+
+                # Show available options
+                response_parts = [f"Yes, {product_name} is available from:"]
+                for item in available_products[:3]:  # Show up to 3 options
+                    supplier_name = item.get("supplier", {}).get("name", "Unknown supplier")
+                    price = item.get("unit_price_etb", 0)
+                    unit = item.get("unit", "kg")
+                    quantity = item.get("quantity_available", 0)
+                    response_parts.append(f"- {supplier_name}: {price} ETB per {unit} ({quantity} {unit} available)")
+
+                return " ".join(response_parts)
+
+            # Product not found - check if it's a supplier name
+            supplier = await self.database_tool.run({
+                "table": "users",
+                "method": "get_user_by_name",
+                "args": [product_name],
+                "kwargs": {}
+            })
+
+            if supplier and supplier.get("role") == "supplier":
+                # Supplier found - show products available from this supplier
+                result = await self.database_tool.run({
+                    "table": "supplier_products",
+                    "method": "list_supplier_products",
+                    "args": [],
+                    "kwargs": {"filters": {"supplier": supplier["user_id"]}}
+                })
+
+                available_products = []
+                for item in result:
+                    if item.get("quantity_available", 0) > 0:
+                        available_products.append(item)
+
+                if not available_products:
+                    return f"Sorry, {product_name} doesn't have any products available right now."
+
+                # Set supplier_id in session context for future orders
+                session_context["supplier_id"] = supplier["user_id"]
+
+                # Show products from this supplier
+                response_parts = [f"Products available from {product_name}:"]
+                for item in available_products[:5]:  # Show up to 5 products
+                    product_name_display = item.get("product", {}).get("product_name_en", "Unknown product")
+                    price = item.get("unit_price_etb", 0)
+                    unit = item.get("unit", "kg")
+                    quantity = item.get("quantity_available", 0)
+                    response_parts.append(f"- {product_name_display}: {price} ETB per {unit} ({quantity} {unit} available)")
+
+                return " ".join(response_parts)
+
+            # Neither product nor supplier found
+            return f"Sorry, {product_name} is not currently available."
+
+        except Exception as exc:
+            logger.error(f"Failed to check availability: {exc}")
+            return "I couldn't check availability right now. Please try again."
+
+    async def _handle_storage_advice(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Provide storage advice using RAG (Retrieval-Augmented Generation)."""
+        product_name = filled_slots.get("product_name")
+        if not product_name:
+            return "What product do you need storage advice for?"
+
+        try:
+            # First, find the product in the database to get its English name
+            product = await self.database_tool.run({
+                "table": "products",
+                "method": "find_product_by_any_name",
+                "args": [product_name],
+                "kwargs": {}
+            })
+
+            # Use English name for vector search since the vector DB only has English content
+            search_name = product_name
+            if product and product.get("product_name_en") and product["product_name_en"] != "Unknown":
+                search_name = product["product_name_en"]
+
+            # Retrieve relevant context
+            context = await self.vector_search.run({
+                "query": f"storage advice for {search_name}",
+                "top_k": 5  # Get more results for better context
+            })
+
+            if context.get("error"):
+                return f"I don't have specific storage advice for {product_name}, but generally keep fresh produce in a cool, dry place."
+
+            results = context.get("results", [])
+            if not results:
+                return f"I don't have specific storage advice for {product_name}, but generally keep fresh produce in a cool, dry place."
+
+            # Extract relevant text from results
+            context_texts = []
+            for result in results[:3]:  # Use top 3 results for context
+                text = result.get("text", "").strip()
+                if text and len(text) > 10:
+                    context_texts.append(text)
+
+            if not context_texts:
+                return f"I don't have specific storage advice for {product_name} in my knowledge base, but here are some general tips for storing fresh produce: Keep most vegetables and fruits in a cool, dry place away from direct sunlight. Refrigerate leafy greens and cut produce in airtight containers. Wash fruits and vegetables just before eating, not before storing. Store different types of produce separately to prevent ethylene gas from speeding up ripening. Check regularly and remove any spoiled items to prevent them from affecting others."
+
+            # Use RAG: Combine retrieved context with LLM generation
+            context_combined = "\n".join(context_texts)
+            user_question = f"How should I store {product_name}?"
+
+            # Create RAG prompt
+            rag_prompt = f"""
+You are a food storage expert providing objective storage advice. Do not mention ordering, marketplace, suppliers, customers, or KCartBot. Focus only on storage recommendations.
+
+Based on the following storage information, provide helpful and practical advice for storing {product_name}.
+
+Storage Information:
+{context_combined}
+
+User Question: {user_question}
+
+Please provide clear, concise storage advice that incorporates the relevant information above. Focus on practical tips that will help preserve freshness and quality.
 """
 
+            # Use LLM to generate response
+            llm = self.llm_service.clone(system_prompt="")
+            llm_response = await llm.acomplete(rag_prompt)
+
+            if llm_response and llm_response.strip():
+                return llm_response.strip()
+            else:
+                # Fallback to direct context if LLM fails
+                return f"For {product_name}: {context_texts[0]}"
+
+        except Exception as exc:
+            logger.error(f"Failed to get storage advice: {exc}")
+            return f"Generally, keep {product_name} in a cool, dry place away from direct sunlight. For best results, store fresh produce in the refrigerator for leafy greens and cut items, wash just before eating, and check regularly for spoilage."
+
+    async def _handle_nutrition_query(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle nutrition comparison queries using RAG."""
+        product_a = filled_slots.get("product_a")
+        product_b = filled_slots.get("product_b")
+
+        if not product_a or not product_b:
+            return "Which two products would you like to compare nutritionally?"
+
+        try:
+            # Get English names for both products
+            english_names = []
+            for product_name in [product_a, product_b]:
+                product = await self.database_tool.run({
+                    "table": "products",
+                    "method": "find_product_by_any_name",
+                    "args": [product_name],
+                    "kwargs": {}
+                })
+                if product and product.get("product_name_en") and product["product_name_en"] != "Unknown":
+                    english_names.append(product["product_name_en"])
+                else:
+                    english_names.append(product_name)
+
+            # Retrieve relevant context
+            context = await self.vector_search.run({
+                "query": f"nutritional comparison between {english_names[0]} and {english_names[1]}",
+                "top_k": 5
+            })
+
+            if context.get("error") or not context.get("results"):
+                return f"I don't have specific nutritional data comparing {product_a} and {product_b}."
+
+            # Extract relevant text from results
+            context_texts = []
+            for result in context["results"][:3]:  # Use top 3 results
+                text = result.get("text", "").strip()
+                if text and len(text) > 10:
+                    context_texts.append(text)
+
+            if not context_texts:
+                return f"I don't have specific nutritional data comparing {product_a} and {product_b}."
+
+            # Use RAG: Combine retrieved context with LLM generation
+            context_combined = "\n".join(context_texts)
+            user_question = f"How do {product_a} and {product_b} compare nutritionally?"
+
+            # Create RAG prompt
+            rag_prompt = f"""
+You are a nutrition expert providing objective nutritional information. Do not mention ordering, marketplace, suppliers, customers, or KCartBot. Focus only on the nutritional comparison.
+
+Based on the following nutritional information, provide a helpful comparison between {product_a} and {product_b}.
+
+Nutritional Information:
+{context_combined}
+
+User Question: {user_question}
+
+Please provide a clear, balanced nutritional comparison that highlights the key differences and similarities between these two products. Include specific nutritional benefits or considerations for each.
+"""
+
+            # Use LLM to generate response
+            llm = self.llm_service.clone(system_prompt="")
+            llm_response = await llm.acomplete(rag_prompt)
+
+            if llm_response and llm_response.strip():
+                return llm_response.strip()
+            else:
+                # Fallback to direct context
+                return f"Nutritional comparison: {context_texts[0]}"
+
+        except Exception as exc:
+            logger.error(f"Failed to get nutrition info: {exc}")
+            return f"I couldn't find nutritional information comparing {product_a} and {product_b}."
+
+    async def _handle_seasonal_query(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle seasonal availability queries using RAG."""
+        season = filled_slots.get("season")
+        location = filled_slots.get("location")
+
+        query = "seasonal produce availability"
+        if season:
+            query += f" in {season}"
+        if location:
+            query += f" in {location}"
 
-def _ensure_event_loop() -> asyncio.AbstractEventLoop:
-	"""Return running event loop or create a new one for sync fallbacks."""
-	try:
-		return asyncio.get_running_loop()
-	except RuntimeError:
-		loop = asyncio.new_event_loop()
-		asyncio.set_event_loop(loop)
-		return loop
-
-
-class ForgivingReActParser(ReActSingleInputOutputParser):
-	"""Custom ReAct parser that handles common LLM formatting mistakes."""
-
-	def parse(self, text: str) -> Union[AgentAction, AgentFinish]:
-		"""Parse LLM output, fixing common formatting issues before standard parsing."""
-		# Fix standalone "Final Answer" without "Action:" prefix
-		text = re.sub(
-			r'\n(Final Answer):\s*',
-			r'\nAction: \1\nAction Input: ',
-			text,
-			flags=re.IGNORECASE
-		)
-		
-		# If model outputs just "Final Answer" with input on same/next line, fix it
-		text = re.sub(
-			r'\n(Final Answer)\s+([^\n]+)',
-			r'\nAction: \1\nAction Input: \2',
-			text,
-			flags=re.IGNORECASE
-		)
-		
-		try:
-			parsed = super().parse(text)
-			if isinstance(parsed, AgentAction) and parsed.tool.strip().lower() == "final answer":
-				output_text = parsed.tool_input if isinstance(parsed.tool_input, str) else str(parsed.tool_input)
-				return AgentFinish(
-					return_values={"output": output_text.strip()},
-					log=text,
-				)
-			return parsed
-		except Exception:
-			# If parsing still fails, check if there's any final answer content
-			final_answer_match = re.search(
-				r'(?:Action:\s*)?Final Answer[:\s]+(.+)',
-				text,
-				re.IGNORECASE | re.DOTALL
-			)
-			if final_answer_match:
-				return AgentFinish(
-					return_values={"output": final_answer_match.group(1).strip()},
-					log=text,
-				)
-			raise
-
-
-class LLMServiceChatModel(BaseChatModel):
-	"""Adapter that exposes :class:`LLMService` as a LangChain chat model."""
-
-	def __init__(self, llm_service: LLMService) -> None:
-		super().__init__()
-		self._service = llm_service
-		self._base_system_prompt = llm_service.system_prompt
-
-	@property
-	def _llm_type(self) -> str:  # noqa: D401 - LangChain interface
-		return "llm_service_chat_model"
-
-	def _convert_messages(
-		self, messages: Sequence[BaseMessage]
-	) -> tuple[List[Dict[str, str]], str, str]:
-		system_parts: List[str] = []
-		history: List[Dict[str, str]] = []
-		prompt_content = ""
-
-		for message in messages:
-			if isinstance(message, SystemMessage):
-				system_parts.append(message.content)
-			elif isinstance(message, HumanMessage):
-				history.append({"role": "user", "content": message.content})
-			elif isinstance(message, AIMessage):
-				history.append({"role": "assistant", "content": message.content})
-
-		# Extract latest user input as prompt
-		for idx in range(len(history) - 1, -1, -1):
-			if history[idx]["role"] == "user":
-				prompt_content = history[idx]["content"]
-				# Remove the last user-entry from history so it's treated as prompt
-				del history[idx]
-				break
-
-		combined_system = "\n".join(part.strip() for part in system_parts if part.strip())
-		return history, prompt_content, combined_system
-
-	async def _agenerate(
-		self,
-		messages: Sequence[BaseMessage],
-		stop: Optional[List[str]] = None,
-		**kwargs: Any,
-	) -> ChatResult:
-		history, prompt, dynamic_system = self._convert_messages(messages)
-		original_system = self._service.system_prompt
-		if dynamic_system:
-			updated_prompt = f"{self._base_system_prompt}\n\n{dynamic_system}"
-			self._service.update_system_prompt(updated_prompt)
-		try:
-			response_text = await self._service.acomplete(prompt, history=history, **kwargs)
-		finally:
-			self._service.update_system_prompt(original_system)
-
-		if response_text and stop:
-			for token in stop:
-				if token in response_text:
-					response_text = response_text.split(token)[0]
-					break
-		elif not response_text:
-			response_text = ""
-
-		message = AIMessage(content=response_text)
-		generation = ChatGeneration(message=message, text=response_text)
-		return ChatResult(generations=[generation])
-
-	def _generate(
-		self,
-		messages: Sequence[BaseMessage],
-		stop: Optional[List[str]] = None,
-		**kwargs: Any,
-	) -> ChatResult:
-		loop = _ensure_event_loop()
-		if loop.is_running():
-			raise RuntimeError("Synchronous generation is not supported while an event loop is running. Use 'ainvoke'.")
-		return loop.run_until_complete(self._agenerate(messages, stop=stop, **kwargs))
-
-
-class LangChainToolAdapter(BaseTool):
-	"""Wrap :class:`ToolBase` instances for LangChain agents."""
-
-	def __init__(
-		self,
-		tool: ToolBase,
-		context_getter: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
-	) -> None:
-		super().__init__(name=tool.name, description=tool.description)
-		self._tool = tool
-		self._get_context = context_getter
-		self._last_call_key: Optional[str] = None
-		self._last_call_result: Any = None
-
-	def _make_cache_key(self, tool_input: Any, context: Optional[Dict[str, Any]]) -> Optional[str]:
-		try:
-			if isinstance(tool_input, str):
-				key = tool_input.strip()
-			elif isinstance(tool_input, (dict, list, tuple)):
-				key = json.dumps(tool_input, sort_keys=True)
-			else:
-				key = str(tool_input)
-		except Exception:  # pragma: no cover - defensive
-			return None
-		return key or None
-
-	def _clone_result(self, result: Any) -> Any:
-		try:
-			return copy.deepcopy(result)
-		except Exception:  # pragma: no cover - defensive
-			self._last_call_key = None
-			self._last_call_result = None
-			return result
-
-	def _run(self, tool_input: Any, **kwargs: Any) -> Any:
-		loop = _ensure_event_loop()
-		if loop.is_running():
-			raise RuntimeError("Synchronous tool execution not supported inside a running event loop.")
-		context = self._get_context() if self._get_context else None
-		cache_key = self._make_cache_key(tool_input, context)
-		if cache_key and cache_key == self._last_call_key:
-			cached = self._clone_result(self._last_call_result)
-			if isinstance(cached, dict):
-				cached.setdefault("_cached_result", True)
-			return cached
-		try:
-			result = loop.run_until_complete(self._tool.run(tool_input, context=context))
-		except Exception:
-			self._last_call_key = None
-			self._last_call_result = None
-			raise
-		if cache_key:
-			self._last_call_key = cache_key
-			self._last_call_result = self._clone_result(result)
-		else:
-			self._last_call_key = None
-			self._last_call_result = None
-		return result
-
-	async def _arun(self, tool_input: Any, **kwargs: Any) -> Any:
-		context = self._get_context() if self._get_context else None
-		cache_key = self._make_cache_key(tool_input, context)
-		if cache_key and cache_key == self._last_call_key:
-			cached = self._clone_result(self._last_call_result)
-			if isinstance(cached, dict):
-				cached.setdefault("_cached_result", True)
-			return cached
-		try:
-			result = await self._tool.run(tool_input, context=context)
-		except Exception:
-			self._last_call_key = None
-			self._last_call_result = None
-			raise
-		if cache_key:
-			self._last_call_key = cache_key
-			self._last_call_result = self._clone_result(result)
-		else:
-			self._last_call_key = None
-			self._last_call_result = None
-		return result
-
-	async def aclose(self) -> None:
-		closer = getattr(self._tool, "aclose", None)
-		if closer:
-			await closer()
-			return
-		sync_closer = getattr(self._tool, "close", None)
-		if sync_closer:
-			loop = asyncio.get_running_loop()
-			await loop.run_in_executor(None, sync_closer)
-
-
-def _serialise_history(history: Sequence[BaseMessage]) -> List[Dict[str, str]]:
-	serialised: List[Dict[str, str]] = []
-	for message in history:
-		if isinstance(message, HumanMessage):
-			serialised.append({"role": "user", "content": message.content})
-		elif isinstance(message, AIMessage):
-			serialised.append({"role": "assistant", "content": message.content})
-		elif isinstance(message, SystemMessage):
-			serialised.append({"role": "system", "content": message.content})
-	return serialised
-
-
-def _normalise_history(
-	entries: Optional[Sequence[Any]],
-) -> List[BaseMessage]:
-	if not entries:
-		return []
-	normalised: List[BaseMessage] = []
-	for item in entries:
-		if isinstance(item, BaseMessage):
-			normalised.append(item)
-		elif isinstance(item, dict):
-			role = (item.get("role") or "").lower()
-			content = item.get("content") or ""
-			if role == "assistant":
-				normalised.append(AIMessage(content=content))
-			elif role == "system":
-				normalised.append(SystemMessage(content=content))
-			else:
-				normalised.append(HumanMessage(content=content))
-		else:
-			normalised.append(HumanMessage(content=str(item)))
-	return normalised
-
-
-def _extract_classifier_output(intermediate_steps: List[Any]) -> Optional[Dict[str, Any]]:
-	for action, observation in intermediate_steps:
-		if getattr(action, "tool", "") == "intent_classifier":
-			if isinstance(observation, dict):
-				return observation
-			if isinstance(observation, str):
-				try:
-					return json.loads(observation)
-				except json.JSONDecodeError:
-					return {"raw": observation}
-	return None
-
-
-def _summarise_tool_calls(intermediate_steps: List[Any]) -> List[Dict[str, Any]]:
-	summary: List[Dict[str, Any]] = []
-	for action, observation in intermediate_steps:
-		summary.append(
-			{
-				"tool": getattr(action, "tool", "unknown"),
-				"input": getattr(action, "tool_input", None),
-				"observation": observation,
-			}
-		)
-	return summary
-
-
-@dataclass
-class AgentTurn:
-	response: str
-	intent: Optional[str]
-	flow: Optional[str]
-	classifier_output: Optional[Dict[str, Any]]
-	tool_calls: List[Dict[str, Any]]
-	history: List[BaseMessage]
-	trace: Dict[str, Any]
-
-
-class KcartAgent:
-	"""High-level orchestrator that wires tools, LLM, and memory together."""
-
-	def __init__(
-		self,
-		*,
-		llm_service: Optional[LLMService] = None,
-		extra_tools: Optional[Iterable[ToolBase]] = None,
-	) -> None:
-		self._service = llm_service or LLMService(system_prompt=AGENT_SYSTEM_PROMPT)
-		self._llm = LLMServiceChatModel(self._service)
-		self._context: Dict[str, Any] = {}
-		# ReAct format guard message keeps retries user-friendly when parsing fails.
-		self._parsing_error_message = (
-			"I stumbled while planning that step. Please restate your reasoning using the Thought/Action/Action Input/Observation format, "
-			"reuse the latest tool observations instead of calling the same tool again, and then provide the final answer."
-		)
-
-		# Build tool suite
-		classifier_service = self._service.clone(system_prompt=CLASSIFIER_SYSTEM_PROMPT)
-		intent_tool = IntentClassifierTool(
-			llm_service=classifier_service,
-			system_prompt=CLASSIFIER_SYSTEM_PROMPT,
-		)
-		default_tools: List[ToolBase] = [
-			intent_tool,
-			VectorSearchTool(),
-			DataAccessTool(),
-			AnalyticsDataTool(),
-			ScheduleTool(),
-			FlashSaleTool(),
-			ImageGeneratorTool(),
-		]
-		if extra_tools:
-			default_tools.extend(extra_tools)
-
-		self._tool_adapters: List[LangChainToolAdapter] = [
-			LangChainToolAdapter(tool, context_getter=self._get_context)
-			for tool in default_tools
-		]
-
-		self._react_instructions = (
-			"CRITICAL: To respond to the user, you MUST return output in this EXACT format:\n\n"
-			"Thought: [your reasoning about what to do next]\n"
-			"Action: [tool name from the available tools list]\n"
-			"Action Input: [the input to pass to that tool]\n"
-			"Observation: [the tool's response will appear here]\n\n"
-			"Repeat Thought/Action/Action Input/Observation as many times as needed.\n\n"
-			"When you have enough information to answer the user, use this EXACT format:\n"
-			"Thought: I now have enough information to respond to the user.\n"
-			"Action: Final Answer\n"
-			"Action Input: [your complete response to the user]\n\n"
-			"NEVER write just 'Final Answer' alone - it must be preceded by 'Action: ' on the same line.\n"
-			"NEVER skip the 'Thought:' line before 'Action: Final Answer'."
-		)
-
-		self._prompt = ChatPromptTemplate.from_messages(
-			[
-				("system", AGENT_SYSTEM_PROMPT + "\n\n" + self._react_instructions),
-				("system", "Session context (JSON): {session_context}"),
-				(
-					"system",
-					"Available tools:\n{tools}\nRefer to them exactly by name when planning: {tool_names}",
-				),
-				MessagesPlaceholder(variable_name="chat_history"),
-				("assistant", "{agent_scratchpad}"),
-				("human", "{input}"),
-			]
-		)
-
-		tool_descriptions = "\n".join(
-			f"- {adapter.name}: {adapter.description}" for adapter in self._tool_adapters
-		)
-		tool_names = ", ".join(adapter.name for adapter in self._tool_adapters)
-		self._prompt = self._prompt.partial(
-			tools=tool_descriptions or "- No tools configured",
-			tool_names=tool_names or "none",
-		)
-
-		self._executor = self._build_executor()
-
-	def _build_executor(self) -> AgentExecutor:
-		agent = create_react_agent(
-			self._llm,
-			self._tool_adapters,
-			self._prompt,
-			output_parser=ForgivingReActParser(),
-		)
-		return AgentExecutor(
-			agent=agent,
-			tools=self._tool_adapters,
-			return_intermediate_steps=True,
-			handle_parsing_errors=self._parsing_error_message,
-			max_iterations=8,
-			early_stopping_method="force",
-		)
-
-	def _get_context(self) -> Dict[str, Any]:
-		return self._context
-
-	@staticmethod
-	def _format_decimal(value: Any) -> Optional[str]:
-		if value is None:
-			return None
-		try:
-			number = Decimal(str(value))
-		except (InvalidOperation, ValueError, TypeError):
-			return None
-		return f"{number.quantize(Decimal('0.01')):.2f}"
-
-	@staticmethod
-	def _find_supplier_listing(
-		tool_calls: Sequence[Dict[str, Any]],
-		product_id: Optional[str],
-	) -> Optional[Dict[str, Any]]:
-		if not product_id:
-			return None
-		for call in reversed(tool_calls):
-			if call.get("tool") != "data_access":
-				continue
-			observation = call.get("observation")
-			if not isinstance(observation, dict):
-				continue
-			entries = observation.get("results")
-			if not isinstance(entries, list):
-				continue
-			for entry in entries:
-				if isinstance(entry, dict) and str(entry.get("product_id")) == str(product_id):
-					return entry
-		return None
-
-	@staticmethod
-	def _extract_supplier_price(listing: Optional[Dict[str, Any]]) -> Optional[Any]:
-		if not listing:
-			return None
-		return listing.get("unit_price_etb") or listing.get("unit_price")
-
-	@staticmethod
-	def _parse_tool_input(raw_input: Any) -> Optional[Dict[str, Any]]:
-		if raw_input is None:
-			return None
-		if isinstance(raw_input, dict):
-			return raw_input
-		if isinstance(raw_input, str):
-			try:
-				return json.loads(raw_input)
-			except json.JSONDecodeError:
-				return None
-		return None
-
-	@staticmethod
-	def _extract_filter_value(
-		tool_calls: Sequence[Dict[str, Any]],
-		filter_key: str,
-	) -> Optional[Any]:
-		for call in tool_calls:
-			if call.get("tool") != "data_access":
-				continue
-			parsed = KcartAgent._parse_tool_input(call.get("input"))
-			if not isinstance(parsed, dict):
-				continue
-			filters = parsed.get("filters")
-			if isinstance(filters, dict) and filter_key in filters:
-				return filters.get(filter_key)
-		return None
-
-	@staticmethod
-	def _normalise_unit_label(unit: Any) -> str:
-		if not unit:
-			return ""
-		label = str(unit).strip()
-		if not label:
-			return ""
-		if label.lower().startswith("unittype."):
-			label = label.split(".", 1)[-1]
-		label = label.replace("_", " ").strip()
-		return label.lower()
-
-	@staticmethod
-	def _coerce_decimal(value: Any) -> Optional[Decimal]:
-		if value is None:
-			return None
-		try:
-			return Decimal(str(value))
-		except (InvalidOperation, ValueError, TypeError):
-			return None
-
-	def _format_quantity_phrase(self, quantity: Optional[Any], unit: Optional[Any]) -> Optional[str]:
-		amount = self._coerce_decimal(quantity)
-		if amount is None:
-			return None
-		quantity_display = self._format_decimal(amount)
-		if quantity_display and quantity_display.endswith(".00"):
-			quantity_display = quantity_display[:-3]
-		if quantity_display and "." in quantity_display:
-			quantity_display = quantity_display.rstrip("0").rstrip(".") or quantity_display
-		unit_label = self._normalise_unit_label(unit)
-		if unit_label == "liter" and amount != Decimal("1"):
-			unit_label = "liters"
-		elif unit_label in {"kilogram", "kilograms"}:
-			unit_label = "kg"
-		elif not unit_label:
-			unit_label = "units"
-		return f"{quantity_display} {unit_label}"
-
-	@staticmethod
-	def _find_listing_by_inventory_id(
-		tool_calls: Sequence[Dict[str, Any]],
-		inventory_id: Optional[str],
-	) -> Optional[Dict[str, Any]]:
-		if not inventory_id:
-			return None
-		for call in reversed(tool_calls):
-			if call.get("tool") != "data_access":
-				continue
-			observation = call.get("observation")
-			if not isinstance(observation, dict):
-				continue
-			results = observation.get("results")
-			if not isinstance(results, list):
-				continue
-			for entry in results:
-				if isinstance(entry, dict) and str(entry.get("inventory_id")) == str(inventory_id):
-					return entry
-		return None
-
-	def _build_pricing_guidance_fallback(
-		self,
-		tool_calls: List[Dict[str, Any]],
-	) -> Optional[str]:
-		for call in reversed(tool_calls):
-			if call.get("tool") != "analytics_data":
-				continue
-			observation = call.get("observation")
-			if not isinstance(observation, dict):
-				continue
-			if observation.get("recommended_price") is None:
-				continue
-			return self._format_pricing_message(tool_calls, observation)
-		return None
-
-	def _format_pricing_message(
-		self,
-		tool_calls: List[Dict[str, Any]],
-		observation: Dict[str, Any],
-	) -> Optional[str]:
-		product_name = observation.get("product_name") or "this product"
-		currency = observation.get("currency") or "ETB"
-		unit = observation.get("unit") or ""
-		unit_suffix = f" per {unit}" if unit else ""
-		recommended = self._format_decimal(observation.get("recommended_price"))
-		price_band = observation.get("price_band") or {}
-		floor_price = self._format_decimal(price_band.get("floor"))
-		ceiling_price = self._format_decimal(price_band.get("ceiling"))
-		listing = self._find_supplier_listing(tool_calls, observation.get("product_id"))
-		current_price_value = self._extract_supplier_price(listing)
-		current_price = self._format_decimal(current_price_value)
-		confidence = observation.get("confidence")
-
-		if not recommended:
-			return None
-
-		sentences: List[str] = []
-		if current_price:
-			sentences.append(
-				f"You're currently listing {product_name} at {current_price} {currency}{unit_suffix}."
-			)
-		else:
-			sentences.append(f"Here's what I found for {product_name}.")
-
-		band_clause = ""
-		if floor_price and ceiling_price:
-			band_clause = f" (range {floor_price}-{ceiling_price} {currency}{unit_suffix})"
-		elif floor_price and not ceiling_price:
-			band_clause = f" (floor {floor_price} {currency}{unit_suffix})"
-		elif ceiling_price and not floor_price:
-			band_clause = f" (ceiling {ceiling_price} {currency}{unit_suffix})"
-
-		sentences.append(
-			f"My pricing guidance recommends {recommended} {currency}{unit_suffix}{band_clause} based on current market data."
-		)
-
-		if confidence:
-			sentences.append(f"Confidence: {confidence}.")
-
-		sentences.append("Let me know if you'd like me to adjust the price or review another item.")
-		return " ".join(sentences)
-
-	@staticmethod
-	def _extract_product_name(
-		tool_calls: Sequence[Dict[str, Any]],
-		product_id: Optional[str],
-	) -> Optional[str]:
-		if not product_id:
-			return None
-		for call in reversed(tool_calls):
-			if call.get("tool") != "data_access":
-				continue
-			observation = call.get("observation")
-			if isinstance(observation, dict):
-				if str(observation.get("product_id")) == str(product_id):
-					for key in ("product_name_en", "product_name", "name"):
-						if observation.get(key):
-							return str(observation[key])
-					return None
-				results = observation.get("results")
-				if isinstance(results, list):
-					for entry in results:
-						if not isinstance(entry, dict):
-							continue
-						if str(entry.get("product_id")) == str(product_id):
-							for key in ("product_name_en", "product_name", "name"):
-								if entry.get(key):
-									return str(entry[key])
-		return None
-
-	def _build_inventory_fallback(
-		self,
-		tool_calls: List[Dict[str, Any]],
-	) -> Optional[str]:
-		listings: List[Dict[str, Any]] = []
-		for call in reversed(tool_calls):
-			if call.get("tool") != "data_access":
-				continue
-			observation = call.get("observation")
-			if not isinstance(observation, dict):
-				continue
-			results = observation.get("results")
-			if not isinstance(results, list):
-				continue
-			for entry in results:
-				if isinstance(entry, dict):
-					listings.append(entry)
-			if listings:
-				break
-		if not listings:
-			return None
-
-		formatted_entries: List[str] = []
-		for entry in listings:
-			quantity = entry.get("quantity_available")
-			if quantity is None:
-				continue
-			quantity_display = self._format_decimal(quantity) or str(quantity)
-			unit_label = self._normalise_unit_label(entry.get("unit"))
-			unit_phrase = f" {unit_label}" if unit_label else ""
-			product_label = entry.get("product_name")
-			if not product_label:
-				product_label = self._extract_product_name(tool_calls, entry.get("product_id"))
-			if not product_label:
-				product_label = self._extract_filter_value(tool_calls, "product_name")
-			label = str(product_label) if product_label else "Unnamed product"
-
-			unit_price = self._extract_supplier_price(entry)
-			unit_price_display = self._format_decimal(unit_price)
-			per_clause = f" per {unit_label}" if unit_label else ""
-			price_clause = ""
-			if unit_price_display:
-				price_clause = f" at {unit_price_display} ETB{per_clause}"
-
-			status_bits: List[str] = []
-			if entry.get("is_expired"):
-				status_bits.append("expired")
-			else:
-				effective_status = str(entry.get("effective_status") or entry.get("status") or "").strip()
-				if effective_status and effective_status.lower() not in {"", "active"}:
-					status_bits.append(effective_status.replace("_", " ").lower())
-			expiry_date = entry.get("expiry_date")
-			if expiry_date:
-				status_bits.append(f"expiry {expiry_date}")
-			status_suffix = f" ({', '.join(status_bits)})" if status_bits else ""
-
-			formatted_entries.append(
-				f"{label}: {quantity_display}{unit_phrase}{price_clause}{status_suffix}"
-			)
-
-		if not formatted_entries:
-			return None
-
-		visible_entries = formatted_entries[:5]
-		remaining = len(formatted_entries) - len(visible_entries)
-		summary = "; ".join(visible_entries)
-		if remaining > 0:
-			remainder_phrase = f"; and {remaining} more item{'s' if remaining != 1 else ''}"
-			summary += remainder_phrase
-
-		return f"Inventory snapshot: {summary}. Need any help adjusting stock or prices?"
-
-	def _build_inventory_deletion_confirmation(
-		self,
-		tool_calls: List[Dict[str, Any]],
-	) -> Optional[str]:
-		for call in reversed(tool_calls):
-			if call.get("tool") != "data_access":
-				continue
-			observation = call.get("observation")
-			message: Optional[str] = None
-			if isinstance(observation, dict):
-				message = observation.get("message")
-			elif isinstance(observation, str):
-				message = observation
-			if not message or "deleted" not in message.lower():
-				continue
-			parsed_input = self._parse_tool_input(call.get("input"))
-			inventory_id: Optional[str] = None
-			product_hint: Optional[str] = None
-			if isinstance(parsed_input, dict):
-				inventory_id = parsed_input.get("id") or parsed_input.get("inventory_id")
-				filters = parsed_input.get("filters")
-				if isinstance(filters, dict):
-					inventory_id = inventory_id or filters.get("inventory_id")
-					product_hint = filters.get("product_name") or filters.get("name")
-			listing = self._find_listing_by_inventory_id(tool_calls, inventory_id)
-			label = None
-			if isinstance(listing, dict):
-				label = listing.get("product_name") or listing.get("name")
-			if not label:
-				label = product_hint or "that item"
-			quantity_display = None
-			unit_phrase = ""
-			price_clause = ""
-			status_bits: List[str] = []
-			expiry_note = None
-			if isinstance(listing, dict):
-				quantity_display = self._format_decimal(listing.get("quantity_available"))
-				if not quantity_display and listing.get("quantity_available") is not None:
-					quantity_display = str(listing.get("quantity_available"))
-				unit_label = self._normalise_unit_label(listing.get("unit"))
-				if unit_label:
-					unit_phrase = f" {unit_label}"
-				unit_price = self._extract_supplier_price(listing)
-				unit_price_display = self._format_decimal(unit_price)
-				if unit_price_display:
-					per_clause = f" per {unit_label}" if unit_label else ""
-					price_clause = f" at {unit_price_display} ETB{per_clause}"
-				if listing.get("is_expired"):
-					status_bits.append("expired")
-				else:
-					effective_status = str(listing.get("effective_status") or listing.get("status") or "").strip()
-					if effective_status and effective_status.lower() not in {"", "active"}:
-						status_bits.append(effective_status.replace("_", " ").lower())
-				expiry_note = listing.get("expiry_date")
-			if expiry_note:
-				status_bits.append(f"expiry {expiry_note}")
-			status_suffix = f" ({', '.join(status_bits)})" if status_bits else ""
-			quantity_clause = f" {quantity_display}{unit_phrase}" if quantity_display else ""
-			return (
-				f"Removed {label}{quantity_clause}{price_clause}{status_suffix}. Anything else to update?"
-			)
-		return None
-
-	def _build_customer_order_prompt(
-		self,
-		tool_calls: List[Dict[str, Any]],
-		classifier_output: Optional[Dict[str, Any]],
-		user_input: Optional[str],
-	) -> Optional[str]:
-		user_role = None
-		if isinstance(self._context, dict):
-			user_info = self._context.get("user")
-			if isinstance(user_info, dict):
-				user_role = str(user_info.get("role") or "").lower()
-		if user_role and user_role != "customer":
-			return None
-
-		structured_items: List[Dict[str, Any]] = []
-		relevant_intent = False
-		if classifier_output:
-			flow_value = (classifier_output.get("flow") or "").lower()
-			if flow_value and flow_value != "customer":
-				return None
-			intent_label = classifier_output.get("intent") or ""
-			if intent_label.startswith("intent.supplier"):
-				return None
-			relevant_intent = intent_label in {
-				"intent.customer.place_order",
-				"intent.customer.check_availability",
-			}
-			filled_slots = classifier_output.get("filled_slots") or {}
-			order_items_slot = filled_slots.get("order_items")
-			if isinstance(order_items_slot, list):
-				structured_items = [item for item in order_items_slot if isinstance(item, dict)]
-			elif isinstance(order_items_slot, dict):
-				structured_items = [order_items_slot]
-			else:
-				maybe_item = {
-					"product_name": filled_slots.get("product_name"),
-					"quantity": filled_slots.get("quantity"),
-					"unit": filled_slots.get("unit"),
-					"supplier_name": filled_slots.get("supplier_name"),
-				}
-				if any(value for value in maybe_item.values()):
-					structured_items = [maybe_item]
-
-		selected_item: Dict[str, Any] = structured_items[0] if structured_items else {}
-		quantity_value = selected_item.get("quantity")
-		unit_value = selected_item.get("unit") or selected_item.get("unit_name")
-		product_hint = selected_item.get("product_name") or selected_item.get("name")
-		supplier_hint = selected_item.get("supplier_name") or selected_item.get("supplier")
-
-		parsed_quantity = self._coerce_decimal(quantity_value)
-		if parsed_quantity is None and user_input:
-			match = re.search(r"(\d+(?:\.\d+)?)\s*(kg|kgs?|kilograms?|liter|liters?|litres?|ltr|ltrs?)?", user_input, re.IGNORECASE)
-			if match:
-				parsed_quantity = self._coerce_decimal(match.group(1))
-				if not unit_value and match.group(2):
-					unit_value = match.group(2)
-
-		listing: Optional[Dict[str, Any]] = None
-		filter_product: Optional[str] = None
-		filter_supplier: Optional[str] = None
-		for call in reversed(tool_calls):
-			if call.get("tool") != "data_access":
-				continue
-			parsed_input = self._parse_tool_input(call.get("input"))
-			if not isinstance(parsed_input, dict):
-				continue
-			if parsed_input.get("entity") != "supplier_products" or parsed_input.get("operation") != "search":
-				continue
-			filters = parsed_input.get("filters") if isinstance(parsed_input.get("filters"), dict) else {}
-			if filter_product is None:
-				filter_product = filters.get("product_name") or filters.get("name")
-			if filter_supplier is None:
-				filter_supplier = filters.get("supplier_name") or filters.get("supplier")
-			observation = call.get("observation")
-			if isinstance(observation, dict):
-				results = observation.get("results")
-				if isinstance(results, list) and results:
-					listing = results[0]
-					break
-
-		if not listing:
-			return None
-
-		if not relevant_intent and not parsed_quantity and not structured_items:
-			if not user_input or not re.search(r"\b(order|buy|get|need)\b", user_input, re.IGNORECASE):
-				return None
-
-		product_label = (
-			product_hint
-			or (listing.get("product_name") if isinstance(listing, dict) else None)
-			or filter_product
-		)
-		supplier_label = supplier_hint or filter_supplier
-		if not product_label:
-			return None
-
-		listing_unit = listing.get("unit") if isinstance(listing, dict) else None
-		if unit_value is None:
-			unit_value = listing_unit
-		unit_price = None
-		if isinstance(listing, dict):
-			unit_price = (
-				listing.get("unit_price_etb")
-				or listing.get("unit_price")
-				or listing.get("price_per_unit")
-			)
-
-		available_qty = listing.get("quantity_available") if isinstance(listing, dict) else None
-		quantity_phrase = self._format_quantity_phrase(parsed_quantity, unit_value)
-		available_phrase = None
-		if available_qty is not None:
-			available_phrase = self._format_quantity_phrase(available_qty, listing_unit or unit_value)
-
-		price_display = self._format_decimal(unit_price)
-		if price_display and price_display.endswith(".00"):
-			price_display = price_display[:-3]
-		per_unit_label = self._normalise_unit_label(unit_value)
-		per_unit_suffix = ""
-		if per_unit_label == "kg":
-			per_unit_suffix = " per kg"
-		elif per_unit_label == "liter":
-			per_unit_suffix = " per liter"
-		elif per_unit_label:
-			per_unit_suffix = f" per {per_unit_label}"
-
-		total_display = None
-		if parsed_quantity is not None and unit_price is not None:
-			unit_price_decimal = self._coerce_decimal(unit_price)
-			if unit_price_decimal is not None:
-				total_display = self._format_decimal(parsed_quantity * unit_price_decimal)
-				if total_display and total_display.endswith(".00"):
-					total_display = total_display[:-3]
-
-		sentences: List[str] = []
-		if supplier_label:
-			lead_sentence = f"{supplier_label} has {product_label}"
-		else:
-			lead_sentence = f"I found {product_label}"
-		if price_display:
-			lead_sentence += f" at {price_display} ETB{per_unit_suffix}"
-		elif per_unit_label:
-			lead_sentence += f" sold per {per_unit_label}"
-		sentences.append(lead_sentence.strip() + ".")
-
-		if available_phrase:
-			sentences.append(f"Current stock: {available_phrase}.")
-		elif isinstance(listing, dict) and listing.get("is_expired"):
-			sentences.append("This batch is marked expired.")
-
-		if quantity_phrase:
-			if total_display:
-				sentences.append(f"I can line up {quantity_phrase} for roughly {total_display} ETB.")
-			else:
-				sentences.append(f"I can line up {quantity_phrase} for you.")
-		else:
-			sentences.append("How much should I add to your basket?")
-
-		if isinstance(listing, dict) and listing.get("expiry_date"):
-			sentences.append(f"Expiry: {listing['expiry_date']}.")
-
-		sentences.append("Should I go ahead and place the order and confirm delivery details?")
-		return " ".join(sentences)
-
-	def _build_schedule_followup(
-		self,
-		tool_calls: List[Dict[str, Any]],
-	) -> Optional[str]:
-		for call in reversed(tool_calls):
-			if call.get("tool") != "schedule_helper":
-				continue
-			observation = call.get("observation")
-			if not isinstance(observation, dict):
-				continue
-			resolved = observation.get("resolved_date")
-			if not resolved:
-				continue
-			try:
-				resolved_date = date.fromisoformat(str(resolved))
-			except (ValueError, TypeError):
-				resolved_date = None
-			if resolved_date:
-				pretty = resolved_date.strftime("%d %b %Y")
-			else:
-				pretty = str(resolved)
-			notes = observation.get("notes") or []
-			if "Interpreted" in " ".join(notes):
-				return (
-					f"I'll record the expiry date as {pretty}. Which delivery days should I note for this stock?"
-				)
-			return f"I'll record the expiry date as {pretty}. Could you share your delivery schedule?"
-		return None
-
-	@staticmethod
-	def _is_storage_question(user_input: Optional[str]) -> bool:
-		if not user_input:
-			return False
-		lowered = user_input.lower()
-		storage_markers = (
-			" store",
-			" storage",
-			" keep",
-			" keeping",
-			" preserve",
-			"ታከማ",
-			"ማከማ",
-		)
-		return any(marker in lowered for marker in storage_markers)
-
-	def _build_fallback_reply(
-		self,
-		tool_calls: List[Dict[str, Any]],
-		user_input: Optional[str],
-		classifier_output: Optional[Dict[str, Any]],
-	) -> Optional[str]:
-		text = self._build_schedule_followup(tool_calls)
-		if text:
-			return text
-
-		text = self._build_pricing_guidance_fallback(tool_calls)
-		if text:
-			return text
-
-		text = self._build_inventory_deletion_confirmation(tool_calls)
-		if text:
-			return text
-
-		text = self._build_customer_order_prompt(tool_calls, classifier_output, user_input)
-		if text:
-			return text
-
-		if self._is_storage_question(user_input):
-			return None
-
-		return self._build_inventory_fallback(tool_calls)
-
-	async def aclose(self) -> None:
-		for adapter in self._tool_adapters:
-			await adapter.aclose()
-
-	def close(self) -> None:
-		loop = _ensure_event_loop()
-		if loop.is_running():
-			raise RuntimeError("Synchronous close not supported inside a running event loop. Use 'await aclose()'.")
-		loop.run_until_complete(self.aclose())
-
-	async def ainvoke(
-		self,
-		user_input: str,
-		*,
-		chat_history: Optional[Sequence[Any]] = None,
-		context: Optional[Dict[str, Any]] = None,
-	) -> AgentTurn:
-		normalised_history = _normalise_history(chat_history)
-		
-		# Build context with chat history for tools to access
-		self._context = context or {}
-		self._context["chat_history"] = _serialise_history(normalised_history)
-		
-		session_context = json.dumps(self._context, ensure_ascii=False) if self._context else "{}"
-
-		result = await self._executor.ainvoke(
-			{
-				"input": user_input,
-				"chat_history": normalised_history,
-				"session_context": session_context,
-			}
-		)
-
-		tool_calls = _summarise_tool_calls(result.get("intermediate_steps", []))
-		classifier_output = _extract_classifier_output(result.get("intermediate_steps", []))
-		intent = classifier_output.get("intent") if classifier_output else None
-		flow = classifier_output.get("flow") if classifier_output else None
-
-		response_text = result.get("output") or ""
-		fallback_reply = None
-		if response_text.strip() in {"", "Agent stopped due to iteration limit or time limit."}:
-			fallback_reply = self._build_fallback_reply(tool_calls, user_input, classifier_output)
-		if fallback_reply:
-			response_text = fallback_reply
-		elif not response_text:
-			response_text = (
-				"I hit my planning limit on that step. Could you rephrase or give me a little more detail?"
-			)
-
-		augmented_history = list(normalised_history)
-		augmented_history.append(HumanMessage(content=user_input))
-		augmented_history.append(AIMessage(content=response_text))
-
-		trace = {
-			"raw": result,
-			"history": _serialise_history(augmented_history),
-		}
-
-		return AgentTurn(
-			response=response_text,
-			intent=intent,
-			flow=flow,
-			classifier_output=classifier_output,
-			tool_calls=tool_calls,
-			history=augmented_history,
-			trace=trace,
-		)
-
-	def invoke(
-		self,
-		user_input: str,
-		*,
-		chat_history: Optional[Sequence[Any]] = None,
-		context: Optional[Dict[str, Any]] = None,
-	) -> AgentTurn:
-		loop = _ensure_event_loop()
-		return loop.run_until_complete(
-			self.ainvoke(user_input, chat_history=chat_history, context=context)
-		)
+        user_question = f"What produce is available in {season or 'different seasons'}{' in ' + location if location else ''}?"
+
+        try:
+            # Retrieve relevant context
+            context = await self.vector_search.run({
+                "query": query,
+                "top_k": 5
+            })
+
+            if context.get("error") or not context.get("results"):
+                return "I don't have specific seasonal information right now."
+
+            # Extract relevant text from results
+            context_texts = []
+            for result in context["results"][:3]:  # Use top 3 results
+                text = result.get("text", "").strip()
+                if text and len(text) > 10:
+                    context_texts.append(text)
+
+            if not context_texts:
+                return "I don't have specific seasonal information in my knowledge base right now."
+
+            # Use RAG: Combine retrieved context with LLM generation
+            context_combined = "\n".join(context_texts)
+
+            # Create RAG prompt
+            rag_prompt = f"""
+You are a seasonal produce expert providing objective information about produce availability. Do not mention ordering, marketplace, suppliers, customers, or KCartBot. Focus only on seasonal availability.
+
+Based on the following seasonal produce information, provide helpful advice about produce availability.
+
+Seasonal Information:
+{context_combined}
+
+User Question: {user_question}
+
+Please provide clear, organized information about seasonal produce availability. Include specific fruits and vegetables that are typically available during this time, and any relevant tips about quality or selection.
+"""
+
+            # Use LLM to generate response
+            llm = self.llm_service.clone(system_prompt="")
+            llm_response = await llm.acomplete(rag_prompt)
+
+            if llm_response and llm_response.strip():
+                return llm_response.strip()
+            else:
+                # Fallback to direct context
+                return f"Seasonal information: {context_texts[0]}"
+
+        except Exception as exc:
+            logger.error(f"Failed to get seasonal info: {exc}")
+            return "I couldn't find seasonal availability information."
+
+    async def _handle_in_season_query(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle 'what's in season' queries using RAG."""
+        location = filled_slots.get("location")
+        query = "what produce is currently in season"
+        if location:
+            query += f" in {location}"
+
+        user_question = f"What produce is currently in season{' in ' + location if location else ''}?"
+
+        try:
+            # Retrieve relevant context
+            context = await self.vector_search.run({
+                "query": query,
+                "top_k": 5
+            })
+
+            if context.get("error") or not context.get("results"):
+                return "I don't have current seasonal information."
+
+            # Extract relevant text from results
+            context_texts = []
+            for result in context["results"][:3]:  # Use top 3 results
+                text = result.get("text", "").strip()
+                if text and len(text) > 10:
+                    context_texts.append(text)
+
+            if not context_texts:
+                return "I don't have current seasonal information in my knowledge base right now."
+
+            # Use RAG: Combine retrieved context with LLM generation
+            context_combined = "\n".join(context_texts)
+
+            # Create RAG prompt
+            rag_prompt = f"""
+You are a seasonal produce expert providing objective information about current seasonal produce. Do not mention ordering, marketplace, suppliers, customers, or KCartBot. Focus only on what's currently in season.
+
+Based on the following information about seasonal produce, provide helpful information about what's currently in season.
+
+Seasonal Information:
+{context_combined}
+
+User Question: {user_question}
+
+Please provide clear, organized information about produce that is currently in season. Include specific fruits and vegetables, and any relevant tips about quality, selection, or availability.
+"""
+
+            # Use LLM to generate response
+            llm = self.llm_service.clone(system_prompt="")
+            llm_response = await llm.acomplete(rag_prompt)
+
+            if llm_response and llm_response.strip():
+                return llm_response.strip()
+            else:
+                # Fallback to direct context
+                return f"Currently in season: {context_texts[0]}"
+
+        except Exception as exc:
+            logger.error(f"Failed to get in-season info: {exc}")
+            return "I couldn't find information about what's currently in season."
+
+    async def _handle_general_advisory(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle general product advisory questions using RAG."""
+        question = filled_slots.get("question")
+        if not question:
+            return "What question do you have about our products?"
+
+        try:
+            # Retrieve relevant context
+            context = await self.vector_search.run({
+                "query": question,
+                "top_k": 5
+            })
+
+            if context.get("error") or not context.get("results"):
+                return "I don't have information about that topic."
+
+            # Extract relevant text from results
+            context_texts = []
+            for result in context["results"][:3]:  # Use top 3 results
+                text = result.get("text", "").strip()
+                if text and len(text) > 10:
+                    context_texts.append(text)
+
+            if not context_texts:
+                return "I don't have information about that topic in my knowledge base right now."
+
+            # Use RAG: Combine retrieved context with LLM generation
+            context_combined = "\n".join(context_texts)
+
+            # Create RAG prompt
+            rag_prompt = f"""
+You are a fresh produce expert providing objective advice about fruits and vegetables. Do not mention ordering, marketplace, suppliers, customers, or KCartBot. Focus only on the produce-related question.
+
+Based on the following information about fresh produce, provide a helpful and accurate answer to the user's question.
+
+Reference Information:
+{context_combined}
+
+User Question: {question}
+
+Please provide a clear, helpful answer that addresses the user's question using the information provided above. Focus on practical, actionable advice related to fresh produce.
+"""
+
+            # Use LLM to generate response
+            llm = self.llm_service.clone(system_prompt="")
+            llm_response = await llm.acomplete(rag_prompt)
+
+            if llm_response and llm_response.strip():
+                return llm_response.strip()
+            else:
+                # Fallback to direct context
+                return f"Here's what I know: {context_texts[0]}"
+
+        except Exception as exc:
+            logger.error(f"Failed to get advisory info: {exc}")
+            return "I couldn't find information about that."
+
+    async def _handle_place_order(
+        self, filled_slots: Dict[str, Any], missing_slots: List[str], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle order placement."""
+        user_id = session_context.get("user_id")
+        if not user_id:
+            return "Please register first before placing an order."
+
+        order_items = filled_slots.get("order_items", [])
+        if not order_items:
+            return "What would you like to order?"
+
+        # Handle case where order_items is a string (product name) instead of list
+        if isinstance(order_items, str):
+            # Convert string to expected list format
+            order_items = [{"product_name": order_items}]
+
+        # Check if we have missing slots that need to be filled
+        if missing_slots:
+            if "quantity" in missing_slots:
+                return "How much would you like to order?"
+            elif "preferred_delivery_date" in missing_slots:
+                return "When would you like this delivered?"
+
+        try:
+            # Create the order
+            total_price = 0
+            order_details = []
+
+            for item in order_items:
+                # Handle both dict format and string format
+                if isinstance(item, dict):
+                    product_name = item.get("product_name", "")
+                    quantity = item.get("quantity", 1)
+                else:
+                    # If item is a string, treat it as product name
+                    product_name = str(item)
+                    quantity = 1  # Default quantity
+
+                # Find the product by any name
+                product = await self.database_tool.run({
+                    "table": "products",
+                    "method": "find_product_by_any_name",
+                    "args": [product_name],
+                    "kwargs": {}
+                })
+
+                if not product:
+                    return f"Sorry, {product_name} is not available."
+
+                # Get supplier products for this product
+                supplier_id = session_context.get("supplier_id")
+                if supplier_id:
+                    supplier_products = await self.database_tool.run({
+                        "table": "supplier_products",
+                        "method": "list_supplier_products",
+                        "args": [],
+                        "kwargs": {"filters": {"product": product["product_id"], "supplier": supplier_id}}
+                    })
+                else:
+                    supplier_products = await self.database_tool.run({
+                        "table": "supplier_products",
+                        "method": "list_supplier_products",
+                        "args": [],
+                        "kwargs": {"filters": {"product": product["product_id"]}}
+                    })
+
+                if not supplier_products:
+                    return f"Sorry, {product_name} is not available."
+
+                # Use first available supplier for now
+                supplier_product = supplier_products[0]
+                unit_price = supplier_product.get("unit_price_etb", 0)
+                subtotal = quantity * unit_price
+                total_price += subtotal
+
+                order_details.append({
+                    "product": supplier_product["product"],
+                    "supplier": supplier_product["supplier"],
+                    "quantity": quantity,
+                    "unit_price": unit_price,
+                    "subtotal": subtotal
+                })
+
+            # Create transaction
+            # Get the user model instance
+            user_instance = await self.database_tool.run({
+                "table": "users",
+                "method": "get_user_by_id",
+                "args": [user_id],
+                "kwargs": {},
+                "raw_instances": True
+            })
+
+            if not user_instance:
+                return "User not found. Please register first."
+
+            # Handle delivery date if provided
+            delivery_date = filled_slots.get("delivery_date")
+            resolved_delivery_date = None
+            if delivery_date:
+                try:
+                    resolved_delivery_date = await self.date_resolver.run(delivery_date)
+                except Exception as exc:
+                    logger.warning(f"Failed to resolve delivery date '{delivery_date}': {exc}")
+                    # Continue without delivery date if resolution fails
+
+            transaction = await self.database_tool.run({
+                "table": "transactions",
+                "method": "create_transaction",
+                "args": [],
+                "kwargs": {
+                    "user": user_instance,  # Pass the User model instance
+                    "date": datetime.date.today(),  # Required order date
+                    "total_price": total_price,
+                    "payment_method": "COD",
+                    "status": "Pending",
+                    **({"delivery_date": resolved_delivery_date.isoformat()} if resolved_delivery_date else {})
+                },
+                "raw_instances": True  # Keep the Transaction model instance
+            })
+
+            # Create order items
+            for detail in order_details:
+                logger.info(f"Creating order item for product {detail['product']['product_id']} from supplier {detail['supplier']['user_id']}")
+                # Get the product and supplier model instances
+                product_instance = await self.database_tool.run({
+                    "table": "products",
+                    "method": "get_product_by_id",
+                    "args": [detail["product"]["product_id"]],
+                    "kwargs": {},
+                    "raw_instances": True
+                })
+
+                supplier_instance = await self.database_tool.run({
+                    "table": "users",
+                    "method": "get_user_by_id",
+                    "args": [detail["supplier"]["user_id"]],
+                    "kwargs": {},
+                    "raw_instances": True
+                })
+
+                if not product_instance or not supplier_instance:
+                    logger.error(f"Failed to get product or supplier instances: product_instance={product_instance}, supplier_instance={supplier_instance}")
+                    return "Product or supplier information not found."
+
+                logger.info(f"Creating order item with order={transaction}, product={product_instance}, supplier={supplier_instance}")
+                await self.database_tool.run({
+                    "table": "order_items",
+                    "method": "create_order_item",
+                    "args": [],
+                    "kwargs": {
+                        "order": transaction,  # Pass the Transaction model instance
+                        "product": product_instance,  # Pass the Product model instance
+                        "supplier": supplier_instance,  # Pass the User model instance
+                        "quantity": detail["quantity"],
+                        "unit": "kg",  # Assume kg for now
+                        "price_per_unit": detail["unit_price"],
+                        "subtotal": detail["subtotal"]
+                    }
+                })
+                logger.info(f"Order item created successfully")
+
+            return f"Order placed successfully! Total: {total_price} ETB. Payment will be Cash on Delivery."
+
+        except Exception as exc:
+            logger.error(f"Failed to place order: {exc}")
+            return "I couldn't place your order. Please try again."
+
+    async def _handle_set_delivery_date(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle delivery date setting."""
+        delivery_date = filled_slots.get("delivery_date")
+        if not delivery_date:
+            return "When would you like your delivery?"
+
+        try:
+            # Resolve the date
+            resolved_date = await self.date_resolver.run(delivery_date)
+
+            # Update the most recent pending order
+            user_id = session_context.get("user_id")
+            if not user_id:
+                return "Please register first."
+
+            orders = await self.database_tool.run({
+                "table": "transactions",
+                "method": "list_transactions",
+                "args": [],
+                "kwargs": {"filters": {"user": user_id, "status": "Pending"}}
+            })
+
+            if not orders:
+                return "You don't have any pending orders."
+
+            latest_order = orders[0]  # Assuming sorted by date desc
+
+            await self.database_tool.run({
+                "table": "transactions",
+                "method": "update_transaction",
+                "args": [latest_order["order_id"]],
+                "kwargs": {"delivery_date": resolved_date.isoformat()}
+            })
+
+            return f"Delivery date set to {resolved_date.strftime('%B %d, %Y')}."
+
+        except Exception as exc:
+            logger.error(f"Failed to set delivery date: {exc}")
+            return "I couldn't set the delivery date. Please try again."
+
+    async def _handle_set_delivery_location(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle delivery location setting."""
+        location = filled_slots.get("delivery_location")
+        if not location:
+            return "Where would you like your delivery?"
+
+        # For now, just acknowledge - in practice might need validation
+        return f"Delivery location set to {location}."
+
+    async def _handle_confirm_payment(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle payment confirmation."""
+        order_ref = filled_slots.get("order_reference")
+        if not order_ref:
+            return "Which order would you like to confirm payment for?"
+
+        try:
+            # Update order status to Confirmed
+            await self.database_tool.run({
+                "table": "transactions",
+                "method": "update_transaction",
+                "args": [order_ref],
+                "kwargs": {"status": "Confirmed"}
+            })
+
+            return "Payment confirmed! Your order is now being prepared for delivery."
+
+        except Exception as exc:
+            logger.error(f"Failed to confirm payment: {exc}")
+            return "I couldn't confirm the payment. Please try again."
+
+    async def _handle_customer_check_deliveries(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle customer checking their deliveries."""
+        user_id = session_context.get("user_id")
+        if not user_id:
+            return "Please log in as a customer first."
+
+        date_filter = filled_slots.get("date")
+        order_ref = filled_slots.get("order_reference")
+
+        try:
+            # Query transactions (orders) for this customer
+            transactions = await self.database_tool.run({
+                "table": "transactions",
+                "method": "list_transactions",
+                "args": [],
+                "kwargs": {"filters": {"user": user_id}}
+            })
+
+            if not transactions:
+                return "You have no deliveries scheduled."
+
+            # If a specific date is requested, filter by delivery date
+            if date_filter:
+                resolved_date = await self.date_resolver.run(date_filter)
+                date_str = resolved_date.strftime('%Y-%m-%d')
+                
+                filtered_transactions = []
+                for transaction in transactions:
+                    delivery_date = transaction.get("delivery_date")
+                    if delivery_date:
+                        # Convert delivery_date to date string for comparison
+                        if isinstance(delivery_date, str):
+                            if 'T' in delivery_date:
+                                delivery_date = delivery_date.split('T')[0]
+                        if delivery_date == date_str:
+                            filtered_transactions.append(transaction)
+                transactions = filtered_transactions
+
+                if not transactions:
+                    return f"You have no deliveries scheduled for {resolved_date.strftime('%B %d, %Y')}."
+
+            # If a specific order reference is requested, filter to that order
+            if order_ref:
+                transactions = [t for t in transactions if t.get("order_id", "").startswith(order_ref)]
+                if not transactions:
+                    return f"I couldn't find an order with reference '{order_ref}'."
+
+            # Format the response
+            response_parts = ["Your deliveries:"]
+
+            for transaction in transactions[:10]:  # Limit to 10 orders
+                order_id = transaction.get("order_id", "Unknown")[:8]
+                delivery_date = transaction.get("delivery_date")
+                status = transaction.get("status", "Unknown")
+                total_price = transaction.get("total_price", 0)
+
+                date_str = "Date not set"
+                if delivery_date:
+                    try:
+                        # If delivery_date is already a date string, format it
+                        if isinstance(delivery_date, str):
+                            if 'T' in delivery_date:
+                                delivery_date = delivery_date.split('T')[0]
+                            # Try to parse and format the date
+                            from datetime import datetime
+                            date_obj = datetime.fromisoformat(delivery_date.replace('Z', '+00:00'))
+                            date_str = date_obj.strftime('%B %d, %Y')
+                        else:
+                            date_str = str(delivery_date)
+                    except Exception:
+                        date_str = str(delivery_date)
+
+                response_parts.append(
+                    f"- Order {order_id}...: {date_str} - {status} - {total_price} ETB"
+                )
+
+            if len(transactions) > 10:
+                response_parts.append(f"... and {len(transactions) - 10} more orders.")
+
+            return " ".join(response_parts)
+
+        except Exception as exc:
+            logger.error(f"Failed to check customer deliveries: {exc}")
+            return "I couldn't check your deliveries right now. Please try again."
+
+    # Supplier flow handlers
+    async def _handle_supplier_registration(
+        self, filled_slots: Dict[str, Any], missing_slots: List[str], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle supplier registration."""
+        if missing_slots:
+            slot = missing_slots[0]
+            if slot == "supplier_name":
+                return "Welcome! What's your business name?"
+            elif slot == "phone_number":
+                return "Great! What's your phone number?"
+
+        # All slots filled, register the supplier
+        try:
+            result = await self.database_tool.run({
+                "table": "users",
+                "method": "create_user",
+                "args": [],
+                "kwargs": {
+                    "name": filled_slots["supplier_name"],
+                    "phone": filled_slots["phone_number"],
+                    "default_location": "",  # Suppliers don't need a default location
+                    "preferred_language": "English",  # Default language
+                    "role": "supplier",
+                    "joined_date": datetime.date.today()  # Explicitly set joined date
+                }
+            })
+            session_context["user_id"] = result.get("user_id")
+            return f"Welcome {filled_slots['supplier_name']}! Your supplier account has been created. How can I help you manage your inventory?"
+        except Exception as exc:
+            logger.error(f"Failed to register supplier: {exc}")
+            return "I couldn't create your account. Please try again."
+
+    async def _handle_add_product(
+        self, filled_slots: Dict[str, Any], missing_slots: List[str], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle adding a new product."""
+        user_id = session_context.get("user_id")
+        if not user_id:
+            return "Please register as a supplier first."
+
+        product_name = filled_slots.get("product_name")
+        if not product_name:
+            return "What product would you like to add?"
+
+        # Check if product exists using any name field
+        try:
+            product = await self.database_tool.run({
+                "table": "products",
+                "method": "find_product_by_any_name",
+                "args": [product_name],
+                "kwargs": {}
+            })
+
+            if not product:
+                # Create new product - determine which name field to set based on input
+                create_kwargs = {
+                    "category": "Vegetable",  # Default category
+                    "unit": "kg",  # Default unit
+                    "base_price_etb": 0.0,  # Default base price
+                    "in_season_start": "January",  # Default season start
+                    "in_season_end": "December",  # Default season end
+                }
+
+                # Simple language detection: if contains non-ASCII, assume Amharic
+                if product_name.isascii():
+                    create_kwargs["product_name_en"] = product_name
+                    create_kwargs["product_name_am"] = "Unknown"
+                    create_kwargs["product_name_am_latin"] = "Unknown"
+                else:
+                    create_kwargs["product_name_en"] = "Unknown"
+                    create_kwargs["product_name_am"] = product_name
+                    create_kwargs["product_name_am_latin"] = "Unknown"
+
+                product = await self.database_tool.run({
+                    "table": "products",
+                    "method": "create_product",
+                    "args": [],
+                    "kwargs": create_kwargs
+                })
+
+            product_id = product["product_id"]
+
+            # If this supplier already has this product, prompt whether to add to existing or create new listing
+            supplier_products = await self.database_tool.run({
+                "table": "supplier_products",
+                "method": "list_supplier_products",
+                "args": [],
+                "kwargs": {"filters": {"supplier": user_id, "product": product_id}}
+            })
+
+            if supplier_products:
+                # Save existing supplier product info to session so next steps can use it
+                existing = supplier_products[0]
+                if "pending_product" not in session_context:
+                    session_context["pending_product"] = {}
+
+                session_context["pending_product"].update({
+                    "product_id": product_id,
+                    "product_name": product_name,
+                    "existing_inventory_id": existing.get("inventory_id"),
+                    "existing_quantity": existing.get("quantity_available", 0),
+                    "existing_price": existing.get("unit_price_etb"),
+                    "update_existing": None  # wait for user's choice
+                })
+
+                # Ask the user whether to add to existing or create a separate listing
+                existing_qty = existing.get("quantity_available", 0)
+                existing_price = existing.get("unit_price_etb", "Unknown")
+                return (
+                    f"You already have {product_name}: {existing_qty} kg at {existing_price} ETB/kg. "
+                    "Would you like to add to the existing listing or create a separate listing? "
+                    "Reply 'add' to increase existing inventory or 'new' to create a separate listing."
+                )
+
+            return f"Product '{product_name}' is ready. What's the quantity you have available?"
+
+        except Exception as exc:
+            logger.error(f"Failed to add product: {exc}")
+            return "I couldn't add the product. Please try again."
+
+    async def _handle_set_quantity(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle setting product quantity."""
+        user_id = session_context.get("user_id")
+        if not user_id:
+            return "Please register first."
+
+        product_name = filled_slots.get("product_name")
+        quantity = filled_slots.get("quantity")
+
+        if not product_name or quantity is None:
+            return "What product and how much quantity?"
+
+        # Check if this supplier already has this product and user wants to add to existing
+        user_message = session_context.get("last_user_message", "").lower()
+        is_existing_inventory_request = any(keyword in user_message for keyword in [
+            "existing", "inventory", "add more", "add to my", "more to my", "increase my"
+        ])
+
+        if is_existing_inventory_request:
+            try:
+                # Find the product
+                product = await self.database_tool.run({
+                    "table": "products",
+                    "method": "find_product_by_any_name",
+                    "args": [product_name],
+                    "kwargs": {}
+                })
+
+                if product:
+                    # Check if supplier already has this product
+                    supplier_products = await self.database_tool.run({
+                        "table": "supplier_products",
+                        "method": "list_supplier_products",
+                        "args": [],
+                        "kwargs": {"filters": {"supplier": user_id, "product": product["product_id"]}}
+                    })
+
+                    if supplier_products:
+                        # User wants to add to existing inventory - update quantity directly
+                        existing_product = supplier_products[0]
+                        current_quantity = existing_product.get("quantity_available", 0)
+                        new_quantity = current_quantity + quantity
+
+                        update_kwargs = {"quantity_available": new_quantity}
+
+                        await self.database_tool.run({
+                            "table": "supplier_products",
+                            "method": "update_supplier_product",
+                            "args": [existing_product["inventory_id"]],
+                            "kwargs": update_kwargs
+                        })
+
+                        return f"Added {quantity} kg to your existing {product_name} inventory. Total quantity now: {new_quantity} kg at {existing_product.get('unit_price_etb', 'current price')} ETB per kg, deliverable {existing_product.get('available_delivery_days', 'existing schedule')}."
+
+            except Exception as exc:
+                logger.error(f"Failed to check existing inventory: {exc}")
+                # Fall through to normal flow if check fails
+
+        # Store the quantity information in session context for later use
+        if "pending_product" not in session_context:
+            session_context["pending_product"] = {}
+
+        session_context["pending_product"]["product_name"] = product_name
+        session_context["pending_product"]["quantity"] = quantity
+
+        # Get pricing suggestions before asking for price
+        try:
+            # Find the product to get its ID for competitor price lookup
+            product = await self.database_tool.run({
+                "table": "products",
+                "method": "find_product_by_any_name",
+                "args": [product_name],
+                "kwargs": {}
+            })
+
+            suggestion_text = ""
+            if product:
+                competitor_prices = await self.database_tool.run({
+                    "table": "competitor_prices",
+                    "method": "list_competitor_prices",
+                    "args": [],
+                    "kwargs": {"filters": {"product": product["product_id"]}}
+                })
+
+                if competitor_prices:
+                    prices = [cp.get("price_etb_per_kg", 0) for cp in competitor_prices if cp.get("price_etb_per_kg", 0) > 0]
+                    if prices:
+                        avg_price = sum(prices) / len(prices)
+                        min_price = min(prices)
+                        max_price = max(prices)
+
+                        suggestion_text = f" 📊 **Market Insights for {product_name}:** • Average market price: {avg_price:.1f} ETB/kg • Price range: {min_price:.1f} - {max_price:.1f} ETB/kg • Suggested competitive range: {max(min_price * 0.9, avg_price * 0.85):.1f} - {min(max_price * 1.1, avg_price * 1.15):.1f} ETB/kg"
+
+            return f"I'll add {quantity} kg of {product_name}.{suggestion_text} What's the price per kg in ETB you'd like to set?"
+
+        except Exception as exc:
+            logger.error(f"Failed to get pricing suggestions: {exc}")
+            return f"I'll add {quantity} kg of {product_name}. What's the price per kg in ETB?"
+
+    async def _handle_set_delivery_dates(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle setting delivery dates."""
+        delivery_dates = filled_slots.get("delivery_dates")
+        pending_product = session_context.get("pending_product")
+
+        if not pending_product:
+            return "Please start by adding a product first."
+
+        product_name = pending_product.get("product_name", "this product")
+
+        if not delivery_dates:
+            return f"What days can you deliver {product_name}? (e.g., 'Monday to Friday' or 'weekdays')"
+
+        # Store delivery dates
+        pending_product["delivery_dates"] = delivery_dates
+
+        # Now we have all the information, create the supplier product
+        user_id = session_context.get("user_id")
+        if not user_id:
+            return "Please register first."
+
+        try:
+            # Find the product
+            product = await self.database_tool.run({
+                "table": "products",
+                "method": "find_product_by_any_name",
+                "args": [product_name],
+                "kwargs": {}
+            })
+
+            if not product:
+                return f"Product '{product_name}' not found. Please add it first."
+
+            product_id = product["product_id"]
+
+            # Get the actual model instances for foreign key relationships
+            user = await self.database_tool.run({
+                "table": "users",
+                "method": "get_user_by_id",
+                "args": [user_id],
+                "kwargs": {},
+                "raw_instances": True
+            })
+
+            product = await self.database_tool.run({
+                "table": "products",
+                "method": "get_product_by_id",
+                "args": [product_id],
+                "kwargs": {},
+                "raw_instances": True
+            })
+
+            if not user or not product:
+                return "I couldn't find the required user or product information."
+
+            quantity = pending_product.get("quantity")
+            unit_price = pending_product.get("unit_price")
+            expiry_date = pending_product.get("expiry_date")
+            update_existing = pending_product.get("update_existing")
+
+            # Handle based on user's choice for existing inventory
+            if update_existing is True:
+                # User chose to add to existing inventory - only update quantity
+                supplier_products = await self.database_tool.run({
+                    "table": "supplier_products",
+                    "method": "list_supplier_products",
+                    "args": [],
+                    "kwargs": {"filters": {"supplier": user_id, "product": product_id}}
+                })
+
+                if supplier_products:
+                    # Add to existing quantity
+                    existing_product = supplier_products[0]
+                    current_quantity = existing_product.get("quantity_available", 0)
+                    new_quantity = current_quantity + quantity
+
+                    update_kwargs = {
+                        "quantity_available": new_quantity
+                    }
+
+                    await self.database_tool.run({
+                        "table": "supplier_products",
+                        "method": "update_supplier_product",
+                        "args": [existing_product["inventory_id"]],
+                        "kwargs": update_kwargs
+                    })
+                    # Clear pending product info
+                    session_context.pop("pending_product", None)
+                    return f"Added {quantity} kg to your existing {product_name} inventory. Total quantity now: {new_quantity} kg at {existing_product.get('unit_price_etb', 'current price')} ETB per kg, deliverable {existing_product.get('available_delivery_days', 'existing schedule')}."
+                else:
+                    # No existing inventory found, create new anyway
+                    create_kwargs = {
+                        "supplier": user,  # Pass the user model instance
+                        "product": product,  # Pass the product model instance
+                        "quantity_available": quantity,
+                        "unit": "kg",
+                        "unit_price_etb": unit_price,
+                        "available_delivery_days": delivery_dates,
+                        "status": "active"  # Required status field
+                    }
+                    if expiry_date is not None:
+                        create_kwargs["expiry_date"] = expiry_date
+
+                    await self.database_tool.run({
+                        "table": "supplier_products",
+                        "method": "create_supplier_product",
+                        "args": [],
+                        "kwargs": create_kwargs
+                    })
+                    # Clear pending product info
+                    session_context.pop("pending_product", None)
+                    expiry_info = ""
+                    if expiry_date:
+                        try:
+                            from datetime import datetime
+                            if isinstance(expiry_date, str) and 'T' not in expiry_date:
+                                date_obj = datetime.fromisoformat(expiry_date)
+                                expiry_info = f", expires {date_obj.strftime('%B %d, %Y')}"
+                            else:
+                                expiry_info = f", expires {expiry_date}"
+                        except:
+                            expiry_info = f", expires {expiry_date}"
+                    return f"Added {product_name} to your inventory: {quantity} kg at {unit_price} ETB per kg{expiry_info}, deliverable {delivery_dates}."
+
+            elif update_existing is False:
+                # User chose to create a new listing
+                create_kwargs = {
+                    "supplier": user,  # Pass the user model instance
+                    "product": product,  # Pass the product model instance
+                    "quantity_available": quantity,
+                    "unit": "kg",
+                    "unit_price_etb": unit_price,
+                    "available_delivery_days": delivery_dates,
+                    "status": "active"  # Required status field
+                }
+                if expiry_date is not None:
+                    create_kwargs["expiry_date"] = expiry_date
+
+                await self.database_tool.run({
+                    "table": "supplier_products",
+                    "method": "create_supplier_product",
+                    "args": [],
+                    "kwargs": create_kwargs
+                })
+                # Clear pending product info
+                session_context.pop("pending_product", None)
+                expiry_info = ""
+                if expiry_date:
+                    try:
+                        from datetime import datetime
+                        if isinstance(expiry_date, str) and 'T' not in expiry_date:
+                            date_obj = datetime.fromisoformat(expiry_date)
+                            expiry_info = f", expires {date_obj.strftime('%B %d, %Y')}"
+                        else:
+                            expiry_info = f", expires {expiry_date}"
+                    except:
+                        expiry_info = f", expires {expiry_date}"
+                return f"Created new listing for {product_name}: {quantity} kg at {unit_price} ETB per kg{expiry_info}, deliverable {delivery_dates}."
+
+            else:
+                # Fallback: update_existing not set (shouldn't happen in normal flow)
+                supplier_products = await self.database_tool.run({
+                    "table": "supplier_products",
+                    "method": "list_supplier_products",
+                    "args": [],
+                    "kwargs": {"filters": {"supplier": user_id, "product": product_id}}
+                })
+
+                if supplier_products:
+                    # Update existing
+                    update_kwargs = {
+                        "quantity_available": quantity,
+                        "unit_price_etb": unit_price,
+                        "available_delivery_days": delivery_dates
+                    }
+                    if expiry_date is not None:
+                        update_kwargs["expiry_date"] = expiry_date
+
+                    await self.database_tool.run({
+                        "table": "supplier_products",
+                        "method": "update_supplier_product",
+                        "args": [supplier_products[0]["inventory_id"]],
+                        "kwargs": update_kwargs
+                    })
+                    # Clear pending product info
+                    session_context.pop("pending_product", None)
+                    return f"Updated {product_name}: {quantity} kg at {unit_price} ETB per kg, deliverable {delivery_dates}."
+                else:
+                    # Create new supplier product with all information
+                    create_kwargs = {
+                        "supplier": user,  # Pass the user model instance
+                        "product": product,  # Pass the product model instance
+                        "quantity_available": quantity,
+                        "unit": "kg",
+                        "unit_price_etb": unit_price,
+                        "available_delivery_days": delivery_dates,
+                        "status": "active"  # Required status field
+                    }
+                    if expiry_date is not None:
+                        create_kwargs["expiry_date"] = expiry_date
+
+                    await self.database_tool.run({
+                        "table": "supplier_products",
+                        "method": "create_supplier_product",
+                        "args": [],
+                        "kwargs": create_kwargs
+                    })
+                    # Clear pending product info
+                    session_context.pop("pending_product", None)
+                    expiry_info = ""
+                    if expiry_date:
+                        try:
+                            from datetime import datetime
+                            if isinstance(expiry_date, str) and 'T' not in expiry_date:
+                                date_obj = datetime.fromisoformat(expiry_date)
+                                expiry_info = f", expires {date_obj.strftime('%B %d, %Y')}"
+                            else:
+                                expiry_info = f", expires {expiry_date}"
+                        except Exception:
+                            expiry_info = f", expires {expiry_date}"
+                    return f"Added {product_name} to your inventory: {quantity} kg at {unit_price} ETB per kg{expiry_info}, deliverable {delivery_dates}."
+
+        except Exception as exc:
+            logger.error(f"Failed to create supplier product: {exc}")
+            return "I couldn't add the product to your inventory. Please try again."
+
+    async def _handle_set_expiry_date(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle setting expiry date."""
+        expiry_date_input = filled_slots.get("expiry_date")
+        pending_product = session_context.get("pending_product")
+
+        if not pending_product:
+            return "Please start by adding a product first."
+
+        product_name = pending_product.get("product_name", "this product")
+
+        # Handle cases where user says no expiry or similar
+        if expiry_date_input and any(word in expiry_date_input.lower() for word in ["no", "none", "doesn't", "never", "no expiry"]):
+            pending_product["expiry_date"] = None
+            return f"Noted - {product_name} has no expiry date. What days can you deliver {product_name}? (e.g., 'Monday to Friday' or 'weekdays')"
+
+        if not expiry_date_input:
+            return f"When does {product_name} expire? (You can say 'no expiry' if it doesn't expire)"
+
+        try:
+            resolved_date = await self.date_resolver.run(expiry_date_input)
+            pending_product["expiry_date"] = resolved_date.isoformat()
+            return f"Expiry date set to {resolved_date.strftime('%B %d, %Y')}. What days can you deliver {product_name}? (e.g., 'Monday to Friday' or 'weekdays')"
+        except Exception as exc:
+            logger.error(f"Failed to resolve expiry date: {exc}")
+            # Store the raw input if date resolution fails
+            pending_product["expiry_date"] = expiry_date_input
+            return f"Expiry date noted as: {expiry_date_input}. What days can you deliver {product_name}? (e.g., 'Monday to Friday' or 'weekdays')"
+
+    async def _handle_set_price(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle setting product price."""
+        user_id = session_context.get("user_id")
+        if not user_id:
+            return "Please register first."
+
+        unit_price = filled_slots.get("unit_price")
+
+        if unit_price is None:
+            return "What's the price per kg in ETB?"
+
+        # Check if we have pending product information
+        pending_product = session_context.get("pending_product")
+        if not pending_product:
+            return "Please tell me which product you want to set the price for."
+
+        product_name = pending_product.get("product_name")
+        quantity = pending_product.get("quantity")
+
+        if not product_name or quantity is None:
+            return "I need the product name and quantity first."
+
+        # Store the price in pending product info
+        pending_product["unit_price"] = unit_price
+
+        return f"Great! I'll set the price at {unit_price} ETB per kg. When does this {product_name} expire? (You can say 'no expiry' if it doesn't expire)"
+
+    async def _handle_pricing_insight(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Provide pricing insights."""
+        product_name = filled_slots.get("product_name")
+        if not product_name:
+            return "Which product do you need pricing insights for?"
+
+        try:
+            # Get competitor prices
+            competitor_prices = await self.database_tool.run({
+                "table": "competitor_prices",
+                "method": "list_competitor_prices",
+                "args": [],
+                "kwargs": {"filters": {"product__product_name_en__icontains": product_name}}
+            })
+
+            if not competitor_prices:
+                return f"No competitor pricing data available for {product_name}."
+
+            avg_price = sum(cp.get("price_etb_per_kg", 0) for cp in competitor_prices) / len(competitor_prices)
+            return f"Average competitor price for {product_name}: {avg_price:.2f} ETB per kg."
+
+        except Exception as exc:
+            logger.error(f"Failed to get pricing insight: {exc}")
+            return f"I couldn't get pricing insights for {product_name}."
+
+    async def _handle_generate_image(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Generate product image."""
+        product_name = filled_slots.get("product_name")
+        if not product_name:
+            return "Which product would you like an image for?"
+
+        try:
+            result = await self.image_generator.run(product_name)
+            return f"Image generated for {product_name}: {result}"
+        except Exception as exc:
+            logger.error(f"Failed to generate image: {exc}")
+            return f"I couldn't generate an image for {product_name}."
+
+    async def _handle_check_stock(
+        self, session_context: Dict[str, Any]
+    ) -> str:
+        """Check supplier's stock."""
+        user_id = session_context.get("user_id")
+        if not user_id:
+            return "Please register first."
+
+        try:
+            products = await self.database_tool.run({
+                "table": "supplier_products",
+                "method": "list_supplier_products",
+                "args": [],
+                "kwargs": {"filters": {"supplier": user_id}}
+            })
+
+            if not products:
+                return "You don't have any products in inventory yet."
+
+            response_parts = ["📦 **Your Current Inventory:**"]
+            for product in products:
+                name = product.get("product", {}).get("product_name_en", "Unknown")
+                quantity = product.get("quantity_available", 0)
+                unit = product.get("unit", "kg")
+                price = product.get("unit_price_etb", 0)
+                expiry_date = product.get("expiry_date")
+                delivery_days = product.get("available_delivery_days", "Not specified")
+                status = product.get("status", "unknown")
+
+                # Format expiry date
+                expiry_info = ""
+                if expiry_date:
+                    try:
+                        from datetime import datetime
+                        if isinstance(expiry_date, str):
+                            if 'T' in expiry_date:
+                                expiry_date = expiry_date.split('T')[0]
+                            date_obj = datetime.fromisoformat(expiry_date.replace('Z', '+00:00'))
+                            expiry_info = f" • Expires: {date_obj.strftime('%b %d, %Y')}"
+                        else:
+                            expiry_info = f" • Expires: {expiry_date}"
+                    except:
+                        expiry_info = f" • Expires: {expiry_date}"
+
+                # Format status with emoji
+                status_emoji = "✅" if status == "active" else "⏸️" if status == "on_sale" else "❌"
+
+                response_parts.append(
+                    f"{status_emoji} **{name}** • Quantity: {quantity} {unit} • Price: {price} ETB/{unit} • Delivery: {delivery_days}{expiry_info}"
+                )
+
+            return " ".join(response_parts)
+
+        except Exception as exc:
+            logger.error(f"Failed to check stock: {exc}")
+            return "I couldn't check your inventory."
+
+    async def _handle_view_expiring_products(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """View expiring products."""
+        time_horizon = filled_slots.get("time_horizon", "1 week")
+        return f"Checking products expiring within {time_horizon}."
+
+    async def _handle_accept_flash_sale(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Accept flash sale."""
+        product_name = filled_slots.get("product_name")
+        if not product_name:
+            return "Which product flash sale would you like to accept?"
+
+        return f"Flash sale accepted for {product_name}."
+
+    async def _handle_decline_flash_sale(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Decline flash sale."""
+        product_name = filled_slots.get("product_name")
+        if not product_name:
+            return "Which product flash sale would you like to decline?"
+
+        return f"Flash sale declined for {product_name}."
+
+    async def _handle_view_delivery_schedule(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """View delivery schedule."""
+        date_range = filled_slots.get("date_range")
+        query = "your delivery schedule"
+        if date_range:
+            query += f" for {date_range}"
+
+        return f"Here's {query}."
+
+    async def _handle_check_deliveries_by_date(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Check deliveries by date."""
+        user_id = session_context.get("user_id")
+        if not user_id:
+            return "Please log in as a supplier first."
+
+        date = filled_slots.get("date")
+        if not date:
+            return "Which date would you like to check deliveries for?"
+
+        try:
+            # Resolve the date to ensure proper format
+            resolved_date = await self.date_resolver.run(date)
+            date_str = resolved_date.strftime('%Y-%m-%d')
+
+            # Query order items for this supplier with deliveries on the specified date
+            order_items = await self.database_tool.run({
+                "table": "order_items",
+                "method": "list_order_items",
+                "args": [],
+                "kwargs": {"filters": {"supplier": user_id}}
+            })
+
+            if not order_items:
+                return f"You have no deliveries scheduled for {resolved_date.strftime('%B %d, %Y')}."
+
+            # Filter by delivery date from transactions
+            deliveries_today = []
+            for item in order_items:
+                # Get the transaction for this order item
+                transaction = await self.database_tool.run({
+                    "table": "transactions",
+                    "method": "get_transaction_by_id",
+                    "args": [item["order"]["order_id"]],
+                    "kwargs": {}
+                })
+
+                if transaction and transaction.get("delivery_date"):
+                    # Check if delivery date matches (compare date parts only)
+                    delivery_date = transaction["delivery_date"]
+                    if isinstance(delivery_date, str):
+                        delivery_date = delivery_date.split('T')[0]  # Remove time part if present
+
+                    if delivery_date == date_str and transaction.get("status") in ["Confirmed", "Pending"]:
+                        deliveries_today.append({
+                            "order_id": transaction["order_id"],
+                            "customer": transaction.get("user", "Unknown customer"),
+                            "product": item.get("product", "Unknown product"),
+                            "quantity": item.get("quantity", 0),
+                            "unit": item.get("unit", "kg"),
+                            "status": transaction.get("status", "Unknown")
+                        })
+
+            if not deliveries_today:
+                return f"You have no deliveries scheduled for {resolved_date.strftime('%B %d, %Y')}."
+
+            # Format the response
+            response_parts = [f"Your deliveries for {resolved_date.strftime('%B %d, %Y')}:"]
+
+            for delivery in deliveries_today[:10]:  # Limit to 10 deliveries
+                product_name = "Unknown product"
+                if isinstance(delivery["product"], dict):
+                    product_name = delivery["product"].get("product_name_en", "Unknown product")
+                elif hasattr(delivery["product"], 'get'):
+                    product_name = delivery["product"].get("product_name_en", "Unknown product")
+
+                customer_name = "Unknown customer"
+                if isinstance(delivery["customer"], dict):
+                    customer_name = delivery["customer"].get("name", "Unknown customer")
+
+                response_parts.append(
+                    f"- Order {delivery['order_id'][:8]}...: {product_name} "
+                    f"({delivery['quantity']} {delivery['unit']}) for {customer_name} - {delivery['status']}"
+                )
+
+            if len(deliveries_today) > 10:
+                response_parts.append(f"... and {len(deliveries_today) - 10} more deliveries.")
+
+            return " ".join(response_parts)
+
+        except Exception as exc:
+            logger.error(f"Failed to check deliveries by date: {exc}")
+            return f"I couldn't check your deliveries for {date}. Please try again."
+
+    async def _handle_supplier_check_deliveries(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle supplier checking their deliveries/orders."""
+        user_id = session_context.get("user_id")
+        if not user_id:
+            return "Please log in as a supplier first."
+
+        date_filter = filled_slots.get("date")
+        order_ref = filled_slots.get("order_reference")
+
+        try:
+            # Get pending orders for this supplier
+            pending_orders = await self._get_supplier_pending_orders(user_id)
+
+            if not pending_orders:
+                return "You have no pending orders at this time."
+
+            # If a specific date is requested, we could filter further, but for now just return all pending
+            # The _get_supplier_pending_orders already filters for pending/confirmed status
+
+            # If a specific order reference is requested, filter to that order
+            if order_ref:
+                # This is a simple implementation - in practice might need better matching
+                if order_ref.lower() not in pending_orders.lower():
+                    return f"I couldn't find an order with reference '{order_ref}' in your pending orders."
+
+            return pending_orders
+
+        except Exception as exc:
+            logger.error(f"Failed to check supplier deliveries: {exc}")
+            return "I couldn't check your deliveries right now. Please try again."
+
+    async def _handle_accept_order(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Accept order."""
+        order_ref = filled_slots.get("order_reference")
+        if not order_ref:
+            return "Which order would you like to accept?"
+
+        return f"Order {order_ref} accepted."
+
+    async def _handle_update_inventory(
+        self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
+    ) -> str:
+        """Handle updating existing inventory quantity."""
+        user_id = session_context.get("user_id")
+        if not user_id:
+            return "Please register first."
+
+        product_name = filled_slots.get("product_name")
+        quantity = filled_slots.get("quantity")
+
+        if not product_name or quantity is None:
+            return "What product and how much quantity do you want to add?"
+
+        try:
+            # Find the product
+            product = await self.database_tool.run({
+                "table": "products",
+                "method": "find_product_by_any_name",
+                "args": [product_name],
+                "kwargs": {}
+            })
+
+            if not product:
+                return f"I couldn't find {product_name} in your inventory. Please add it as a new product first."
+
+            # Check if supplier already has this product
+            supplier_products = await self.database_tool.run({
+                "table": "supplier_products",
+                "method": "list_supplier_products",
+                "args": [],
+                "kwargs": {"filters": {"supplier": user_id, "product": product["product_id"]}}
+            })
+
+            if not supplier_products:
+                return f"You don't have {product_name} in your inventory yet. Please add it as a new product first."
+
+            # Update existing inventory - add to current quantity
+            existing_product = supplier_products[0]
+            current_quantity = existing_product.get("quantity_available", 0)
+            new_quantity = current_quantity + quantity
+
+            update_kwargs = {"quantity_available": new_quantity}
+
+            await self.database_tool.run({
+                "table": "supplier_products",
+                "method": "update_supplier_product",
+                "args": [existing_product["inventory_id"]],
+                "kwargs": update_kwargs
+            })
+
+            return f"Added {quantity} kg to your existing {product_name} inventory. Total quantity now: {new_quantity} kg at {existing_product.get('unit_price_etb', 'current price')} ETB per kg, deliverable {existing_product.get('available_delivery_days', 'existing schedule')}."
+
+        except Exception as exc:
+            logger.error(f"Failed to update inventory: {exc}")
+            return f"I couldn't update your {product_name} inventory. Please try again."

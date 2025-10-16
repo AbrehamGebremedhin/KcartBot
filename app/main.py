@@ -1,5 +1,6 @@
 """Application entry point for KcartBot."""
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.routes import router as api_router
@@ -27,6 +28,19 @@ TAGS_METADATA = [
 ]
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+	"""Handle application startup and shutdown events."""
+	# Startup
+	await init_db()
+	
+	try:
+		yield
+	finally:
+		# Shutdown
+		await close_db()
+
+
 app = FastAPI(
 	title="KcartBot",
 	description=APP_DESCRIPTION,
@@ -34,20 +48,9 @@ app = FastAPI(
 	docs_url="/docs",
 	redoc_url="/redoc",
 	openapi_tags=TAGS_METADATA,
+	lifespan=lifespan,
 )
 app.include_router(api_router, prefix="/api")
-
-
-@app.on_event("startup")
-async def on_startup() -> None:
-	"""Initialise database connections when the API boots."""
-	await init_db()
-
-
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
-	"""Gracefully close database connections on shutdown."""
-	await close_db()
 
 
 @app.get("/", tags=["meta"], summary="KcartBot overview")

@@ -262,7 +262,7 @@ class LLMService:
         history: Optional[Iterable[Mapping[str, str]]],
     ) -> List[Mapping[str, str]]:
         messages: List[Mapping[str, str]] = []
-        if self.system_prompt:
+        if self.system_prompt and self.system_prompt.strip():
             messages.append({"role": "system", "content": self.system_prompt.strip()})
 
         if history:

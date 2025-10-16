@@ -34,10 +34,11 @@ class SupplierProductRepository:
     @staticmethod
     async def get_supplier_product_by_id(inventory_id):
         try:
-            return await SupplierProduct.get(inventory_id=inventory_id)
+            supplier_product = await SupplierProduct.get(inventory_id=inventory_id)
+            await supplier_product.fetch_related('supplier', 'product')
+            return supplier_product
         except DoesNotExist:
-            return None
-
+            return None    
     @staticmethod
     async def update_supplier_product(inventory_id, **kwargs):
         supplier_product = await SupplierProductRepository.get_supplier_product_by_id(inventory_id)
@@ -57,7 +58,7 @@ class SupplierProductRepository:
 
     @staticmethod
     async def list_supplier_products(filters=None):
-        query = SupplierProduct.all().prefetch_related('product')
+        query = SupplierProduct.all().prefetch_related('supplier', 'product')
         if filters:
             for key, value in filters.items():
                 if key in {"product_name", "product_name_en"}:
@@ -92,7 +93,7 @@ class SupplierProductRepository:
             expiry_date__gte=current_date,
             quantity_available__gt=0,
             status__in=[SupplierProductStatus.ACTIVE, SupplierProductStatus.ON_SALE],
-        )
+        ).prefetch_related('product')
         return await query
 
     @staticmethod

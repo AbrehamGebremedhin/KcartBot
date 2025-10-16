@@ -9,7 +9,9 @@ class TransactionRepository:
     @staticmethod
     async def get_transaction_by_id(order_id):
         try:
-            return await Transaction.get(order_id=order_id)
+            transaction = await Transaction.get(order_id=order_id)
+            await transaction.fetch_related('user')
+            return transaction
         except DoesNotExist:
             return None
 
@@ -32,7 +34,7 @@ class TransactionRepository:
 
     @staticmethod
     async def list_transactions(filters=None):
-        query = Transaction.all()
+        query = Transaction.all().prefetch_related('user')
         if filters:
             for key, value in filters.items():
                 if isinstance(value, dict):

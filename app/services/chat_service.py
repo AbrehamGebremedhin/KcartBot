@@ -1,503 +1,208 @@
-"""High-level chat service orchestrating sessions for KCartBot."""
+"""Chat service for managing KCartBot conversations and sessions."""
 
 from __future__ import annotations
 
+import json
 import logging
-import re
-from dataclasses import dataclass, field
-from datetime import date, datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
+from uuid import uuid4
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
-
-from app.agents.agent import AgentTurn, KcartAgent
-from app.db.models import (
-	FlashSaleStatus,
-	SupplierProductStatus,
-	TransactionStatus,
-	UserRole,
-)
-from app.db.repository.flash_sale_repository import FlashSaleRepository
-from app.db.repository.order_item_repository import OrderItemRepository
-from app.db.repository.supplier_product_repository import SupplierProductRepository
-from app.db.repository.user_repository import UserRepository
-from app.services.llm_service import LLMServiceError
-from app.tools.access_data import ensure_db_initialized
-
+from app.agents.agent import Agent
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class SessionState:
-	stage: str = "await_role"
-	user_role: Optional[str] = None
-	has_account: Optional[bool] = None
-	name: Optional[str] = None
-	phone: Optional[str] = None
-	user_id: Optional[int] = None
-	context: Dict[str, Any] = field(default_factory=dict)
-	summary_sent: bool = False
-
-
-@dataclass
-class LoginResult:
-	handled: bool
-	response: Optional[str] = None
-	login_completed: bool = False
-
-
 class ChatService:
-	"""Stateful service managing chat sessions with the LangChain agent."""
+    """Service for managing chat conversations with the KCartBot agent."""
 
-	def __init__(self) -> None:
-		self._agent = KcartAgent()
-		self._history: Dict[str, List[BaseMessage]] = {}
-		self._states: Dict[str, SessionState] = {}
+    def __init__(self) -> None:
+        """Initialize the chat service with an agent instance."""
+        self.agent = Agent()
+        # In production, this would be a proper database/cache
+        self._sessions: Dict[str, Dict[str, Any]] = {}
 
-	async def send_message(
-		self,
-		session_id: str,
-		message: str,
-		*,
-		context: Optional[Dict[str, Any]] = None,
-	) -> Dict[str, Any]:
-		"""Process a user message for a session and return agent output."""
-		history = self._history.get(session_id, [])
-		state = self._states.setdefault(session_id, SessionState())
+    async def process_message(
+        self,
+        user_message: str,
+        session_id: Optional[str] = None,
+        user_context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Process a user message in the context of a conversation session.
 
-		login_result = await self._handle_login_flow(state, message)
-		if login_result.handled:
-			history.append(HumanMessage(content=message))
-			if login_result.response:
-				history.append(AIMessage(content=login_result.response))
-			self._history[session_id] = history
-			return {
-				"response": login_result.response or "",
-				"intent": None,
-				"flow": None,
-				"classifier_output": None,
-				"tool_calls": [],
-				"trace": {
-					"login_flow": True,
-					"stage": state.stage,
-					"login_completed": login_result.login_completed,
-				},
-			}
+        Args:
+            user_message: The user's input message
+            session_id: Optional session ID. If not provided, a new session is created.
+            user_context: Optional user context (e.g., user_id, language preference)
 
-		merged_context: Dict[str, Any] = {}
-		if state.context:
-			merged_context.update(state.context)
-		if context:
-			merged_context.update(context)
+        Returns:
+            Dict containing response and session information
+        """
+        try:
+            # Get or create session
+            if not session_id:
+                session_id = str(uuid4())
+                self._sessions[session_id] = self._create_new_session(user_context or {}, session_id)
+                logger.info(f"Created new session: {session_id}")
+            elif session_id not in self._sessions:
+                # Use the provided session_id to create a new session
+                self._sessions[session_id] = self._create_new_session(user_context or {}, session_id)
+                logger.info(f"Created new session with provided ID: {session_id}")
+            else:
+                logger.info(f"Using existing session: {session_id}")
 
-		try:
-			turn: AgentTurn = await self._agent.ainvoke(
-				message,
-				chat_history=history,
-				context=merged_context or None,
-			)
-		except LLMServiceError:
-			history.append(HumanMessage(content=message))
-			fallback_response, fallback_tools, fallback_trace = await self._build_llm_failure_fallback(state, message)
-			if fallback_response:
-				history.append(AIMessage(content=fallback_response))
-			self._history[session_id] = history
-			return {
-				"response": fallback_response,
-				"intent": None,
-				"flow": state.user_role,
-				"classifier_output": None,
-				"tool_calls": fallback_tools,
-				"trace": {
-					"llm_unavailable": True,
-					"fallback": fallback_trace,
-				},
-			}
-		else:
-			self._history[session_id] = turn.history
+            session_context = self._sessions[session_id]
 
-			return {
-				"response": turn.response,
-				"intent": turn.intent,
-				"flow": turn.flow,
-				"classifier_output": turn.classifier_output,
-				"tool_calls": turn.tool_calls,
-				"trace": turn.trace,
-			}
+            # Update session with user context if provided
+            if user_context:
+                session_context.update(user_context)
 
-	def reset_session(self, session_id: str) -> None:
-		"""Clear stored history for a session."""
-		self._history.pop(session_id, None)
-		self._states.pop(session_id, None)
+            # Process the message with the agent
+            result = await self.agent.process_message(user_message, session_context)
 
-	def get_session_history(self, session_id: str) -> List[Dict[str, str]]:
-		"""Expose stored history as serialised entries for external use."""
-		history = self._history.get(session_id, [])
-		serialised: List[Dict[str, str]] = []
-		for message in history:
-			if isinstance(message, HumanMessage):
-				serialised.append({"role": "user", "content": message.content})
-			elif isinstance(message, AIMessage):
-				serialised.append({"role": "assistant", "content": message.content})
-			else:
-				serialised.append({"role": "system", "content": getattr(message, "content", "")})
-		return serialised
+            # Update the session with the new context
+            self._sessions[session_id] = result.get("session_context", session_context)
 
-	async def aclose(self) -> None:
-		await self._agent.aclose()
+            # Prepare response
+            response = {
+                "session_id": session_id,
+                "response": result.get("response", ""),
+                "chat_history": session_context.get("chat_history", []),
+                "intent_info": result.get("intent_info", {}),
+                "timestamp": self._get_current_timestamp(),
+            }
 
-	def close(self) -> None:
-		import asyncio
+            # Add any additional metadata
+            if "error" in result:
+                response["error"] = result["error"]
 
-		try:
-			loop = asyncio.get_running_loop()
-			if loop.is_running():
-				raise RuntimeError("Synchronous close not supported while an event loop is running. Await 'aclose()'.")
-		except RuntimeError:
-			loop = asyncio.new_event_loop()
-			asyncio.set_event_loop(loop)
-		try:
-			loop.run_until_complete(self.aclose())
-		finally:
-			if loop.is_running():
-				return
-			loop.close()
-			asyncio.set_event_loop(None)
+            return response
 
-	async def _handle_login_flow(self, state: SessionState, message: str) -> LoginResult:
-		text = (message or "").strip()
-		lower = text.lower()
+        except Exception as exc:
+            logger.error(f"Error processing message: {exc}")
+            return {
+                "session_id": session_id or str(uuid4()),
+                "response": "I'm sorry, I encountered an error. Please try again.",
+                "chat_history": self._sessions.get(session_id, {}).get("chat_history", []) if session_id else [],
+                "error": str(exc),
+                "timestamp": self._get_current_timestamp(),
+            }
 
-		if state.stage == "await_role":
-			if "supplier" in lower:
-				state.user_role = "supplier"
-			elif "customer" in lower:
-				state.user_role = "customer"
-			else:
-				return LoginResult(
-					handled=True,
-					response="Hi there! Are you shopping as a customer or managing stock as a supplier?",
-				)
-			state.stage = "await_account_status"
-			prompt = (
-				"Great! Do you already have an account or are you brand new?"
-				if state.user_role == "customer"
-				else "Awesome. Do you already have a supplier account or are you getting started?"
-			)
-			return LoginResult(handled=True, response=prompt)
+    def _create_new_session(self, user_context: Dict[str, Any], session_id: Optional[str] = None) -> Dict[str, Any]:
+        """Create a new conversation session."""
+        return {
+            "session_id": session_id or str(uuid4()),
+            "created_at": self._get_current_timestamp(),
+            "chat_history": [],
+            "current_intent": None,
+            "current_flow": None,
+            "filled_slots": {},
+            "missing_slots": [],
+            "user_id": user_context.get("user_id"),
+            "user_role": user_context.get("user_role"),
+            "language": user_context.get("language", "English"),
+            "last_activity": self._get_current_timestamp(),
+        }
 
-		if state.stage == "await_account_status":
-			new_keywords = [
-				"new",
-				"don't have",
-				"do not have",
-				"no account",
-				"not yet",
-				"getting started",
-				"get started",
-			]
-			existing_keywords = ["have", "account", "existing", "yes", "sure"]
-			if any(keyword in lower for keyword in new_keywords):
-				state.has_account = False
-				state.stage = "authenticated"
-				state.context = {
-					"user": {
-						"role": state.user_role,
-						"status": "new",
-					},
-				}
-				message_out = (
-					"Perfect! I'll set you up as we chat and capture any details when you're ready."
-					if state.user_role == "customer"
-					else "Great! We'll help you onboard and get your catalog ready."
-				)
-				return LoginResult(handled=True, response=message_out, login_completed=True)
-			if any(keyword in lower for keyword in existing_keywords):
-				state.has_account = True
-				state.stage = "await_name"
-				return LoginResult(handled=True, response="Perfect! What's the name on the account?")
-			return LoginResult(
-				handled=True,
-				response="Just let me know if you're brand new or already have an account, and we'll get moving!",
-			)
+    def get_session_context(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get the context for a specific session."""
+        return self._sessions.get(session_id)
 
-		if state.stage == "await_name":
-			if not text:
-				return LoginResult(handled=True, response="Could you share the name on the account?")
-			state.name = text
-			state.stage = "await_phone"
-			return LoginResult(
-				handled=True,
-				response=f"Thanks {text}! What's the phone number linked to your account?",
-			)
+    def update_session_context(self, session_id: str, updates: Dict[str, Any]) -> bool:
+        """Update the context for a specific session."""
+        if session_id not in self._sessions:
+            return False
 
-		if state.stage == "await_phone":
-			digits = re.sub(r"\D", "", text)
-			if len(digits) < 9:
-				return LoginResult(
-					handled=True,
-					response="I didn't catch a valid phone number. Could you resend it (including country code if possible)?",
-				)
-			state.phone = digits
-			user = await self._match_user(state)
-			if not user:
-				state.stage = "await_account_status"
-				state.name = None
-				state.phone = None
-				return LoginResult(
-					handled=True,
-					response=(
-						"Hmm, I couldn't find an account with that name and number. Are you new, or do you want to try again with different details?"
-					),
-				)
+        self._sessions[session_id].update(updates)
+        self._sessions[session_id]["last_activity"] = self._get_current_timestamp()
+        return True
 
-			state.stage = "authenticated"
-			state.user_id = user.user_id
-			state.name = user.name
-			state.phone = user.phone
-			state.user_role = user.role.value
-			state.context = {
-				"user": {
-					"id": user.user_id,
-					"role": user.role.value,
-					"status": "existing",
-					"name": user.name,
-					"phone": user.phone,
-					"default_location": user.default_location,
-				},
-			}
-			welcome = f"Welcome back, {user.name}!"
-			if state.user_role == "supplier":
-				summary = await self._build_supplier_summary(user.user_id)
-				response_text = f"{welcome} {summary}"
-			else:
-				response_text = f"{welcome} Let's get you what you need today."
-			return LoginResult(handled=True, response=response_text, login_completed=True)
+    def end_session(self, session_id: str) -> bool:
+        """End a conversation session."""
+        if session_id in self._sessions:
+            # Could add cleanup logic here
+            del self._sessions[session_id]
+            logger.info(f"Ended session: {session_id}")
+            return True
+        return False
 
-		return LoginResult(handled=False)
+    def list_active_sessions(self) -> Dict[str, Dict[str, Any]]:
+        """List all active sessions (for debugging/admin purposes)."""
+        # Return a copy without sensitive data
+        return {
+            sid: {
+                k: v for k, v in session.items()
+                if k not in ["chat_history"]  # Exclude potentially large chat history
+            }
+            for sid, session in self._sessions.items()
+        }
 
-	async def _match_user(self, state: SessionState):
-		filters: Dict[str, Any] = {}
-		if state.name:
-			filters["name"] = {
-				"lookup": "iexact",
-				"value": state.name.strip(),
-			}
-		if state.phone:
-			filters["phone"] = state.phone
-		if state.user_role:
-			filters["role"] = UserRole(state.user_role)
-		users = await UserRepository.list_users(filters)
-		return users[0] if users else None
+    def cleanup_inactive_sessions(self, max_age_hours: int = 24) -> int:
+        """Clean up sessions that haven't been active for the specified hours."""
+        import datetime
 
-	async def _build_supplier_summary(self, supplier_id: int) -> str:
-		expiring_products = await SupplierProductRepository.generate_flash_sale_proposals(
-			supplier_id,
-			within_days=3,
-		)
-		pending_items = await OrderItemRepository.list_order_items(
-			{
-				"supplier_id": supplier_id,
-				"order__status": TransactionStatus.PENDING,
-			}
-		)
-		pending_orders = len({item.order_id for item in pending_items})
-		active_sales = await FlashSaleRepository.list_flash_sales(
-			{
-				"supplier_id": supplier_id,
-				"status": FlashSaleStatus.ACTIVE,
-			}
-		)
-		scheduled_sales = await FlashSaleRepository.list_flash_sales(
-			{
-				"supplier_id": supplier_id,
-				"status": FlashSaleStatus.SCHEDULED,
-			}
-		)
-		proposed_sales = await FlashSaleRepository.list_flash_sales(
-			{
-				"supplier_id": supplier_id,
-				"status": FlashSaleStatus.PROPOSED,
-			}
-		)
-		valid_proposals: List[Any] = []
-		for sale in proposed_sales:
-			await sale.fetch_related("product", "supplier_product")
-			supplier_product = getattr(sale, "supplier_product", None)
-			sp_status = getattr(supplier_product, "status", None)
-			sp_expiry = getattr(supplier_product, "expiry_date", None)
-			if (
-				sp_status in {SupplierProductStatus.ACTIVE, SupplierProductStatus.ON_SALE}
-				and sp_expiry is not None
-				and sp_expiry >= date.today()
-			):
-				valid_proposals.append(sale)
-			else:
-				await FlashSaleRepository.cancel_flash_sale(sale.id)
+        now = datetime.datetime.utcnow()
+        cutoff = now - datetime.timedelta(hours=max_age_hours)
 
-		lines: List[str] = []
-		if pending_orders:
-			lines.append(
-				f"You have {pending_orders} pending order{'s' if pending_orders != 1 else ''} awaiting action "
-				f"covering {len(pending_items)} line item{'s' if len(pending_items) != 1 else ''}."
-			)
-		else:
-			lines.append("No new orders waiting right now — nice and clear!")
+        sessions_to_remove = []
+        for session_id, session in self._sessions.items():
+            last_activity = session.get("last_activity")
+            if last_activity:
+                try:
+                    # Parse ISO timestamp
+                    last_activity_dt = datetime.datetime.fromisoformat(last_activity.replace('Z', '+00:00'))
+                    if last_activity_dt < cutoff:
+                        sessions_to_remove.append(session_id)
+                except (ValueError, AttributeError):
+                    # If we can't parse the timestamp, assume it's old
+                    sessions_to_remove.append(session_id)
 
-		if active_sales:
-			top_discount = max(sale.discount_percent for sale in active_sales)
-			lines.append(
-				f"Active flash sales: {len(active_sales)} (top discount {top_discount:.0f}%)."
-			)
-		else:
-			lines.append("No active flash sales at the moment.")
+        for session_id in sessions_to_remove:
+            del self._sessions[session_id]
+            logger.info(f"Cleaned up inactive session: {session_id}")
 
-		if scheduled_sales:
-			next_sale = min(scheduled_sales, key=lambda sale: sale.start_date)
-			lines.append(
-				f"Next scheduled flash sale kicks off on {next_sale.start_date.strftime('%d %b %Y %H:%M')}."
-			)
+        return len(sessions_to_remove)
 
-		if valid_proposals:
-			product_names = [sale.product.product_name_en for sale in valid_proposals if getattr(sale, "product", None)]
-			recommendation = ", ".join(product_names[:3]) if product_names else f"{len(valid_proposals)} items"
-			lines.append(
-				f"⚠️ {len(valid_proposals)} item{'s' if len(valid_proposals) != 1 else ''} close to expiry ready for flash sale ({recommendation}). "
-				"Tell me to accept or decline a proposal when you're ready."
-			)
-		elif expiring_products:
-			lines.append(
-				"Heads-up: you have stock approaching expiry. I can prep flash sale offers whenever you say the word."
-			)
+    @staticmethod
+    def _get_current_timestamp() -> str:
+        """Get current timestamp in ISO format."""
+        import datetime
+        return datetime.datetime.utcnow().isoformat() + "Z"
 
-		return " ".join(lines)
+    async def get_conversation_summary(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get a summary of the conversation for a session."""
+        session = self.get_session_context(session_id)
+        if not session:
+            return None
 
-	async def _build_llm_failure_fallback(
-		self,
-		state: SessionState,
-		message: str,
-	) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
-		response = (
-			"I'm having trouble reaching our planner right now. Please try again in a moment."
-		)
-		tool_calls: List[Dict[str, Any]] = []
-		trace: Dict[str, Any] = {
-			"reason": "llm_service_unavailable",
-		}
-		text = (message or "").lower()
+        chat_history = session.get("chat_history", [])
+        message_count = len(chat_history)
 
-		if "order" in text or "buy" in text or "purchase" in text:
-			trace["topic"] = "ordering"
-			if state.user_role == "supplier":
-				response = (
-					"Our planner is offline at the moment, so I can't process supplier orders right now. Please try again shortly."
-				)
-			else:
-				response = (
-					"I'm having trouble reaching our ordering assistant right now, so I can't place that order yet. Please try again in a few minutes."
-				)
-			return response, tool_calls, trace
+        if message_count == 0:
+            return {
+                "session_id": session_id,
+                "message_count": 0,
+                "summary": "No messages yet",
+                "current_intent": session.get("current_intent"),
+                "current_flow": session.get("current_flow"),
+            }
 
-		if "flash sale" in text:
-			trace["topic"] = "flash_sales"
-			await ensure_db_initialized()
-			filters: Dict[str, Any] = {"status": FlashSaleStatus.ACTIVE}
-			if state.user_role == "supplier" and state.user_id:
-				filters["supplier_id"] = state.user_id
-			try:
-				sales = await FlashSaleRepository.list_flash_sales(filters)
-			except Exception as exc:  # pragma: no cover - defensive fallback
-				logger.exception("Fallback flash sale lookup failed", exc_info=exc)
-				trace["error"] = str(exc)
-				return response, tool_calls, trace
+        # Get last few messages for summary
+        recent_messages = chat_history[-6:]  # Last 3 exchanges
 
-			results: List[Dict[str, Any]] = []
-			for sale in sales:
-				try:
-					await sale.fetch_related("product", "supplier_product")
-				except Exception:  # pragma: no cover - defensive fetch
-					pass
-				product_name = None
-				product_obj = getattr(sale, "product", None)
-				if product_obj is not None:
-					product_name = getattr(product_obj, "product_name_en", None)
-				if not product_name:
-					product_name = getattr(sale, "product_id", None)
-				discount = getattr(sale, "discount_percent", None)
-				if isinstance(discount, (int, float)):
-					discount_value = float(discount)
-				else:
-					try:
-						discount_value = float(discount) if discount is not None else None
-					except (TypeError, ValueError):
-						discount_value = None
-				start_dt = getattr(sale, "start_date", None)
-				end_dt = getattr(sale, "end_date", None)
-				start_iso = self._format_datetime_for_trace(start_dt)
-				end_iso = self._format_datetime_for_trace(end_dt)
-				results.append(
-					{
-						"id": getattr(sale, "id", None),
-						"product": product_name,
-						"discount_percent": discount_value,
-						"start": start_iso,
-						"end": end_iso,
-					}
-				)
+        # Create a simple summary
+        user_messages = [msg for msg in recent_messages if msg.get("role") == "user"]
+        assistant_messages = [msg for msg in recent_messages if msg.get("role") == "assistant"]
 
-			tool_calls.append(
-				{
-					"tool": "fallback.flash_sales",
-					"input": {"filters": filters},
-					"observation": {"count": len(results), "results": results},
-				}
-			)
+        summary = {
+            "session_id": session_id,
+            "message_count": message_count,
+            "last_user_message": user_messages[-1]["content"] if user_messages else None,
+            "last_assistant_message": assistant_messages[-1]["content"] if assistant_messages else None,
+            "current_intent": session.get("current_intent"),
+            "current_flow": session.get("current_flow"),
+            "user_role": session.get("user_role"),
+            "language": session.get("language"),
+        }
 
-			if results:
-				summaries: List[str] = []
-				for entry in results[:3]:
-					name = entry.get("product") or "Unnamed product"
-					discount_value = entry.get("discount_percent")
-					end_value = entry.get("end")
-					if discount_value is not None:
-						discount_phrase = f"{discount_value:.0f}% off"
-					else:
-						discount_phrase = "discount available"
-					if end_value:
-						discount_phrase += f" until {end_value}"
-					summaries.append(f"{name} ({discount_phrase})")
-				extra_count = len(results) - len(summaries)
-				if extra_count > 0:
-					suffix = "deal" if extra_count == 1 else "deals"
-					extra_clause = f" plus {extra_count} more {suffix}"
-				else:
-					extra_clause = ""
-				response = (
-					"Our planner is slow right now, but I can confirm these active flash sales: "
-					+ "; ".join(summaries)
-					+ extra_clause
-					+ "."
-				)
-			else:
-				if state.user_role == "supplier":
-					response = (
-						"Our planner is slow right now, but I don't see any active flash sales for your catalog at the moment."
-					)
-				else:
-					response = (
-						"Our planner is slow right now, but I couldn't find any marketplace flash sales happening at the moment."
-					)
-
-		return response, tool_calls, trace
-
-	@staticmethod
-	def _format_datetime_for_trace(value: Any) -> Optional[str]:
-		if isinstance(value, datetime):
-			return value.isoformat()
-		if hasattr(value, "isoformat"):
-			try:
-				return value.isoformat()
-			except Exception:  # pragma: no cover - defensive
-				return str(value)
-		return str(value) if value is not None else None
+        return summary

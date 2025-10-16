@@ -9,7 +9,7 @@ class CompetitorPriceRepository:
     @staticmethod
     async def get_competitor_price_by_id(id):
         try:
-            return await CompetitorPrice.get(id=id)
+            return await CompetitorPrice.get(id=id).fetch_related('product')
         except DoesNotExist:
             return None
 
@@ -32,7 +32,7 @@ class CompetitorPriceRepository:
 
     @staticmethod
     async def list_competitor_prices(filters=None):
-        query = CompetitorPrice.all()
+        query = CompetitorPrice.all().prefetch_related('product')
         if filters:
             for key, value in filters.items():
                 if isinstance(value, dict):

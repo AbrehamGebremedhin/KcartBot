@@ -13,7 +13,7 @@ class OrderItemRepository:
     @staticmethod
     async def get_order_item_by_id(id):
         try:
-            return await OrderItem.get(id=id)
+            return await OrderItem.get(id=id).fetch_related('order', 'product', 'supplier')
         except DoesNotExist:
             return None
 
@@ -36,7 +36,7 @@ class OrderItemRepository:
 
     @staticmethod
     async def list_order_items(filters=None):
-        query = OrderItem.all()
+        query = OrderItem.all().prefetch_related('order', 'product', 'supplier')
         if filters:
             for key, value in filters.items():
                 if isinstance(value, dict):

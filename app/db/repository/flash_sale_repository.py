@@ -64,7 +64,7 @@ class FlashSaleRepository:
             ],
         ).order_by("-created_at").first()
         if existing:
-            await existing.fetch_related("supplier_product")
+            await existing.fetch_related("supplier_product", "supplier", "product")
             sp_status = getattr(getattr(existing, "supplier_product", None), "status", None)
             sp_expiry = getattr(getattr(existing, "supplier_product", None), "expiry_date", None)
             if (
@@ -148,13 +148,13 @@ class FlashSaleRepository:
     @staticmethod
     async def get_flash_sale_by_id(flash_sale_id):
         try:
-            return await FlashSale.get(id=flash_sale_id)
+            return await FlashSale.get(id=flash_sale_id).fetch_related('supplier_product', 'supplier', 'product')
         except DoesNotExist:
             return None
 
     @staticmethod
     async def list_flash_sales(filters: Optional[Dict[str, Any]] = None):
-        query = FlashSale.all()
+        query = FlashSale.all().prefetch_related('supplier_product', 'supplier', 'product')
         if filters:
             for key, value in filters.items():
                 if isinstance(value, dict):
