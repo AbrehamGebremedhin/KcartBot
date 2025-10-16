@@ -310,7 +310,15 @@ class IntentClassifierPayload(BaseModel):
 CLASSIFIER_SYSTEM_PROMPT = f"""
 You are the intent classification module for KCartBot. Analyse the most recent user utterance and map it to one of the supported intents.
 
-IMPORTANT: If the user says something like "okay", "yes", "sure", "go ahead", "sounds good", etc., check the conversation context to understand what they are confirming:
+IMPORTANT: The system supports multiple languages - English, Amharic (አማርኛ), and phonetic Amharic (Latin script). You must classify intents regardless of the input language. Common Amharic/phonetic terms:
+- Customer registration: "customer", "የወደድ ምዝገባ", "ye weded mezgeba", "register", "መዝገብ", "mezgeb"
+- Supplier registration: "supplier", "አቅራቢ", "akrabi", "business", "ንግድ", "negd"
+- Product availability: "available", "አለ", "ale", "stock", "ቦታ", "bota"
+- Order placement: "order", "ትዕዛዝ", "tizaz", "buy", "ገዛ", "geza"
+- Storage advice: "store", "አስቀምጥ", "askemteg", "keep", "ያዝ", "yaz"
+- Nutrition query: "nutrition", "ንጥረ ነገር", "niter negger", "calories", "ካሎሪ", "kalori"
+
+If the user says something like "okay", "yes", "sure", "go ahead", "sounds good", etc., check the conversation context to understand what they are confirming:
 - If previous context shows supplier onboarding in progress, classify as "intent.supplier.register"
 - If previous context shows customer onboarding in progress, classify as "intent.customer.register"
 - If confirming an order, classify as "intent.customer.confirm_order"
