@@ -110,16 +110,6 @@ This flow ensures secure, efficient handling of conversational commerce tasks wh
 
    `http://localhost:8000/docs` exposes interactive Swagger for the chat endpoint.
 
-7. **(Optional) Start the Streamlit UI**
-
-   In a separate terminal, run:
-
-   ```powershell
-   uv run streamlit run streamlit_app.py
-   ```
-
-   This launches a web interface at `http://localhost:8501` for chatting with KCartBot.
-
 ## Usage Script (End-to-End Test)
 
 All interactions hit `POST /api/v1/chat` with a stable `session_id`. Suggested flow to exercise every capability:
