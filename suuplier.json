@@ -1,0 +1,94 @@
+{
+  "session_id": "string",
+  "response": "📦 **Your Current Inventory:** ✅ **Mango** • Quantity: 50.0 kg • Price: 75.0 ETB/kg • Delivery: all week • Expires: 2025-10-24",
+  "chat_history": [
+    {
+      "role": "user",
+      "content": "almaz"
+    },
+    {
+      "role": "assistant",
+      "content": "Great! What's your phone number?"
+    },
+    {
+      "role": "user",
+      "content": "0913105760"
+    },
+    {
+      "role": "assistant",
+      "content": "Welcome almaz! Your supplier account has been created. How can I help you manage your inventory today?"
+    },
+    {
+      "role": "user",
+      "content": "አዲስ ምርት ማሰገባት እፈልጋለው"
+    },
+    {
+      "role": "assistant",
+      "content": "ምን አይነት ምርት መጨመር ይፈልጋሉ?"
+    },
+    {
+      "role": "user",
+      "content": "ማንጎ"
+    },
+    {
+      "role": "assistant",
+      "content": "ምን ያህል ብዛት አለዎት?"
+    },
+    {
+      "role": "user",
+      "content": "50"
+    },
+    {
+      "role": "assistant",
+      "content": "I'll add 50 kg of mango. 📊 **Market Insights for mango:** • Average market price: 77.3 ETB/kg • Price range: 48.5 - 116.0 ETB/kg • Suggested competitive range: 65.7 - 88.9 ETB/kg What's the price per kg in ETB?"
+    },
+    {
+      "role": "user",
+      "content": "75"
+    },
+    {
+      "role": "assistant",
+      "content": "Great! I'll set the price at 75 ETB per kg. When does this mango expire? (You can say 'no expiry' if it doesn't expire)"
+    },
+    {
+      "role": "user",
+      "content": "next week"
+    },
+    {
+      "role": "assistant",
+      "content": "Expiry date set to October 24, 2025. What days can you deliver mango? (e.g., 'Monday to Friday' or 'weekdays')"
+    },
+    {
+      "role": "user",
+      "content": "all week"
+    },
+    {
+      "role": "assistant",
+      "content": "Added mango to your inventory: 50 kg at 75 ETB per kg, expires October 24, 2025, deliverable all week."
+    },
+    {
+      "role": "user",
+      "content": "how should i store my mango"
+    },
+    {
+      "role": "assistant",
+      "content": "Store unripe mangoes at room temperature in a paper bag to speed up ripening—adding an apple or banana can help. Once ripe, refrigerate them in the crisper drawer or a plastic bag to extend freshness for 5–7 days. For cut mango, keep it in an airtight container in the fridge for up to 3 days, or freeze cubed pieces for longer storage."
+    },
+    {
+      "role": "user",
+      "content": "what is in my current inventory"
+    },
+    {
+      "role": "assistant",
+      "content": "📦 **Your Current Inventory:** ✅ **Mango** • Quantity: 50.0 kg • Price: 75.0 ETB/kg • Delivery: all week • Expires: 2025-10-24"
+    }
+  ],
+  "intent_info": {
+    "intent": "intent.supplier.check_stock",
+    "flow": "supplier",
+    "filled_slots": {},
+    "missing_slots": ["product_name"]
+  },
+  "timestamp": "2025-10-17T09:06:38.700114Z",
+  "error": null
+}

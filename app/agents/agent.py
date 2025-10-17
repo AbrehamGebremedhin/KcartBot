@@ -109,6 +109,23 @@ class Agent:
         # Default to English
         return "english"
 
+    def _map_language_to_enum(self, language: str) -> str:
+        """
+        Map detected language to PreferredLanguage enum value.
+        
+        Args:
+            language: Detected language ('english', 'amharic', 'phonetic_amharic')
+            
+        Returns:
+            Enum value ('English' or 'Amharic')
+        """
+        if language in ["english", "phonetic_amharic"]:
+            return "English"
+        elif language == "amharic":
+            return "Amharic"
+        else:
+            return "English"  # Default fallback
+
     def _get_multilingual_response(self, key: str, language: str, **kwargs) -> str:
         """
         Get a multilingual response based on the language.
@@ -694,7 +711,7 @@ class Agent:
                         "name": user_name,
                         "phone": phone_number,
                         "default_location": default_location,
-                        "preferred_language": language,  # Store detected language
+                        "preferred_language": self._map_language_to_enum(language),  # Store detected language
                         "role": "customer",
                         "joined_date": datetime.date.today()  # Explicitly set joined date
                     }
@@ -725,7 +742,7 @@ class Agent:
                         "name": supplier_name,
                         "phone": phone_number,
                         "default_location": "",  # Suppliers don't need a default location
-                        "preferred_language": language,  # Store detected language
+                        "preferred_language": self._map_language_to_enum(language),  # Store detected language
                         "role": "supplier",
                         "joined_date": datetime.date.today()  # Explicitly set joined date
                     }
@@ -764,7 +781,7 @@ class Agent:
                     "name": filled_slots["customer_name"],
                     "phone": filled_slots["phone_number"],
                     "default_location": filled_slots["default_location"],
-                    "preferred_language": language,  # Store detected language
+                    "preferred_language": self._map_language_to_enum(language),  # Store detected language
                     "role": "customer",
                     "joined_date": datetime.date.today()  # Explicitly set joined date
                 }
@@ -1574,8 +1591,43 @@ Please provide a clear, helpful answer that addresses the user's question using 
                     except Exception:
                         date_str = str(delivery_date)
 
+                # Get order items to show product names
+                product_names = []
+                try:
+                    order_items = await self.database_tool.run({
+                        "table": "order_items",
+                        "method": "list_order_items",
+                        "args": [],
+                        "kwargs": {"filters": {"order": transaction.get("order_id")}}
+                    })
+                    
+                    if order_items:
+                        for item in order_items:
+                            product_data = item.get("product")
+                            if product_data:
+                                # product_data is already a dict with product details
+                                if isinstance(product_data, dict):
+                                    product_names.append(product_data.get("product_name_en", "Unknown Product"))
+                                else:
+                                    # Fallback: if it's just an ID, fetch the product
+                                    product = await self.database_tool.run({
+                                        "table": "products",
+                                        "method": "get_product_by_id",
+                                        "args": [product_data],
+                                        "kwargs": {}
+                                    })
+                                    if product:
+                                        product_names.append(product.get("product_name_en", "Unknown Product"))
+                except Exception as e:
+                    logger.warning(f"Failed to get product names for order {transaction.get('order_id', 'unknown')}: {e}")
+                
+                product_list = ", ".join(product_names) if product_names else "Unknown Products"
+                
+                # Change status display: show "on delivery" instead of "Pending"
+                display_status = "on delivery" if status == "Pending" else status
+                
                 response_parts.append(
-                    f"- Order {order_id}...: {date_str} - {status} - {total_price} ETB"
+                    f"- Order {order_id}...: {product_list} - {date_str} - {display_status} - you paid {total_price} ETB"
                 )
 
             if len(transactions) > 10:
@@ -1611,7 +1663,7 @@ Please provide a clear, helpful answer that addresses the user's question using 
                     "name": filled_slots["supplier_name"],
                     "phone": filled_slots["phone_number"],
                     "default_location": "",  # Suppliers don't need a default location
-                    "preferred_language": language,  # Store detected language
+                    "preferred_language": self._map_language_to_enum(language),  # Store detected language
                     "role": "supplier",
                     "joined_date": datetime.date.today()  # Explicitly set joined date
                 }
