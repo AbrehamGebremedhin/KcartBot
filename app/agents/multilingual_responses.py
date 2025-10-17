@@ -520,6 +520,11 @@ def get_multilingual_response_dictionary() -> Dict[str, Dict[str, str]]:
             "amharic": "ወደ ክምችትዎ ያለው {product_name} {quantity} ኪግ ተጨምሯል። አሁን ጠቅላላ ብዛት፡ {new_quantity} ኪግ በ{current_price} ብር ለኪሎ፣ ማድረሻ {delivery_days}።",
             "phonetic_amharic": "Wede kimichitiwo yalewi {product_name} {quantity} kig techemirwal. Ahun timirali bizati: {new_quantity} kig be{current_price} birr le kīlo, madireša {delivery_days}."
         },
+        "product_removed": {
+            "english": "Removed {product_name} from your inventory.",
+            "amharic": "ከክምችትዎ {product_name} ተወገደ።",
+            "phonetic_amharic": "Ke kimichitiwo {product_name} tewegeḍe."
+        },
         "inventory_update_error": {
             "english": "I couldn't update your {product_name} inventory. Please try again.",
             "amharic": "የ{product_name} ክምችትዎን ማሻሻል አልቻልኩም። እባክዎ እንደገና ይሞክሩ።",

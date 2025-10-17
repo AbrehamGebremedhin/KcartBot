@@ -2474,8 +2474,31 @@ Please provide a clear, helpful answer that addresses the user's question using 
             # Update existing inventory - add to current quantity
             existing_product = supplier_products[0]
             current_quantity = existing_product.get("quantity_available", 0)
+            
+            # Handle removal (quantity = 0) or negative quantities
+            if quantity == 0:
+                # Remove the product from inventory
+                await self.database_tool.run({
+                    "table": "supplier_products",
+                    "method": "delete_supplier_product",
+                    "args": [existing_product["inventory_id"]],
+                    "kwargs": {}
+                })
+                return self._get_multilingual_response("product_removed", language, product_name=product_name)
+            
             new_quantity = current_quantity + quantity
-
+            
+            if new_quantity <= 0:
+                # If the result would be 0 or negative, remove the product
+                await self.database_tool.run({
+                    "table": "supplier_products",
+                    "method": "delete_supplier_product",
+                    "args": [existing_product["inventory_id"]],
+                    "kwargs": {}
+                })
+                return self._get_multilingual_response("product_removed", language, product_name=product_name)
+            
+            # Update quantity
             update_kwargs = {"quantity_available": new_quantity}
 
             await self.database_tool.run({

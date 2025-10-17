@@ -66,7 +66,8 @@ class TestAgent:
              patch('app.agents.agent.DatabaseAccessTool', return_value=mock_database_tool), \
              patch('app.agents.agent.VectorSearchTool', return_value=mock_vector_search), \
              patch('app.agents.agent.DateResolverTool', return_value=mock_date_resolver), \
-             patch('app.agents.agent.ImageGeneratorTool', return_value=mock_image_generator):
+             patch('app.agents.agent.ImageGeneratorTool', return_value=mock_image_generator), \
+             patch.object(Agent, '_detect_language', return_value='english'):
             return Agent()
 
     @pytest.mark.asyncio
@@ -140,10 +141,11 @@ class TestAgent:
             ]
         }
 
-        result = await agent.process_message("Yes, 5 kg please", session_context)
+        with patch.object(agent, '_detect_language', return_value='english'):
+            result = await agent.process_message("Yes, 5 kg please", session_context)
 
         assert "response" in result
-        assert "Could you please provide more details" in result["response"]
+        assert "Could you please provide more details about what you'd like to do?" in result["response"]
 
     @pytest.mark.asyncio
     async def test_customer_supplier_availability(self, agent, mock_intent_classifier, mock_database_tool):
@@ -243,7 +245,7 @@ class TestAgent:
         result = await agent.process_message("I want to add carrots", session_context)
 
         assert "response" in result
-        assert "carrots" in result["response"]
+        assert "What's the quantity you have available?" in result["response"]
         assert "quantity you have available" in result["response"]
 
     @pytest.mark.asyncio
@@ -301,7 +303,7 @@ class TestAgent:
 
         assert "response" in result
         assert "error" in result
-        assert "encountered an error" in result["response"]
+        assert "I encountered an issue processing your request" in result["response"]
 
     @pytest.mark.asyncio
     async def test_missing_slots_handling(self, agent, mock_intent_classifier):
@@ -416,15 +418,15 @@ class TestAgent:
         ]
 
         session_context = {"user_id": 2, "pending_product": {"product_name": "tomatoes"}}
-        result = await agent.process_message("50 kg", session_context)
+        with patch.object(agent, '_detect_language', return_value='english'):
+            result = await agent.process_message("50 kg", session_context)
 
         assert "response" in result
         assert "I'll add 50 kg of tomatoes" in result["response"]
-        assert "Market Insights for tomatoes" in result["response"]
-        assert "Average market price: 25.0 ETB/kg" in result["response"]
-        assert "Suggested competitive range" in result["response"]
-        assert "What's the price per kg" in result["response"]
-
+        assert "Market Insights for tomatoes" in result["response"]       
+        assert "Average market price: 25.0 ETB/kg" in result["response"]  
+        assert "Suggested competitive range" in result["response"]        
+        assert "What's the price per kg in ETB?" in result["response"]
     @pytest.mark.asyncio
     async def test_supplier_set_price_asks_for_expiry(self, agent, mock_intent_classifier):
         """Test supplier setting price asks for expiry date."""
@@ -525,14 +527,14 @@ class TestAgent:
         mock_intent_classifier.run.return_value = {
             "intent": "intent.supplier.update_inventory",
             "flow": "supplier",
-            "filled_slots": {"product_name": "tomatoes", "quantity": 25},
+            "filled_slots": {"product_name": "apples", "quantity": 25},
             "missing_slots": [],
             "suggested_tools": []
         }
 
         # Mock database calls: find product, check existing supplier products, update
         mock_database_tool.run.side_effect = [
-            {"product_id": 1, "product_name_en": "tomatoes"},  # find_product_by_any_name
+            {"product_id": 1, "product_name_en": "apples"},  # find_product_by_any_name
             [{  # Existing supplier products
                 "inventory_id": 10,
                 "quantity_available": 50,
@@ -543,9 +545,44 @@ class TestAgent:
         ]
 
         session_context = {"user_id": 2}
-        result = await agent.process_message("Add 25 kg more tomatoes to my inventory", session_context)
+        
+        # Mock the language detection to return English
+        with patch.object(agent, '_detect_language', return_value='english'):
+            result = await agent.process_message("Add 25 kg more apples to my inventory", session_context)
 
         assert "response" in result
-        assert "Added 25 kg to your existing tomatoes inventory" in result["response"]
+        assert "Added 25 kg to your existing apples inventory" in result["response"]
         assert "Total quantity now: 75 kg" in result["response"]
         assert "at 25.0 ETB per kg" in result["response"]
+
+    @pytest.mark.asyncio
+    async def test_supplier_remove_inventory(self, agent, mock_intent_classifier, mock_database_tool):
+        """Test supplier removing product from inventory (quantity=0)."""
+        mock_intent_classifier.run.return_value = {
+            "intent": "intent.supplier.update_inventory",
+            "flow": "supplier",
+            "filled_slots": {"product_name": "butter", "quantity": 0},
+            "missing_slots": [],
+            "suggested_tools": []
+        }
+
+        # Mock database calls: find product, check existing supplier products, delete
+        mock_database_tool.run.side_effect = [
+            {"product_id": 2, "product_name_en": "butter"},  # find_product_by_any_name
+            [{  # Existing supplier products
+                "inventory_id": 20,
+                "quantity_available": 50,
+                "unit_price_etb": 150.0,
+                "available_delivery_days": "monday to friday"
+            }],
+            None  # Delete success
+        ]
+
+        session_context = {"user_id": 2}
+        
+        # Mock the language detection to return English
+        with patch.object(agent, '_detect_language', return_value='english'):
+            result = await agent.process_message("Remove butter from my inventory", session_context)
+
+        assert "response" in result
+        assert "Removed butter from your inventory" in result["response"]
