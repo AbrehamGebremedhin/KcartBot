@@ -100,7 +100,7 @@ class ChatService:
             "missing_slots": [],
             "user_id": user_context.get("user_id"),
             "user_role": user_context.get("user_role"),
-            "language": user_context.get("language", "English"),
+            "preferred_language": user_context.get("preferred_language", "English"),
             "last_activity": self._get_current_timestamp(),
         }
 
@@ -202,7 +202,7 @@ class ChatService:
             "current_intent": session.get("current_intent"),
             "current_flow": session.get("current_flow"),
             "user_role": session.get("user_role"),
-            "language": session.get("language"),
+            "preferred_language": session.get("preferred_language"),
         }
 
         return summary

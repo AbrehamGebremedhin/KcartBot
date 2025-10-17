@@ -22,6 +22,9 @@ dependencies = [
     "streamlit>=1.39.0",
 ]
 
+[project.scripts]
+streamlit-app = "streamlit:cli"
+
 [tool.aerich]
 tortoise_orm = "app.core.tortoise_config.TORTOISE_ORM"
 location = "./migrations"
