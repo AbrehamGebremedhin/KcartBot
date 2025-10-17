@@ -2,6 +2,107 @@
 
 Conversational commerce copilot that helps customers shop smarter and suppliers run pricing, inventory, and flash-sale workflows. The bot orchestrates a Gemini LLM, Milvus vector search, and a PostgreSQL operational store behind a FastAPI service.
 
+## Quick Start
+
+Ensure you have Python 3.11+, PostgreSQL, Milvus running, and API keys set up as described in Prerequisites.
+
+### Using uv (Recommended)
+
+1. Clone the repository and navigate to the project directory:
+
+   ```powershell
+   git clone https://github.com/AbrehamGebremedhin/KcartBot.git
+   cd KcartBot
+   ```
+
+2. Install dependencies:
+
+   ```powershell
+   uv sync
+   ```
+
+3. Set up environment variables in `.env`:
+
+   ```dotenv
+   DEEPSEEK_API_KEY=your-deepseek-key
+   GEMINI_API_KEY=your-google-genai-key
+   DATABASE_URL=postgres://kcartbot:kcartbot@localhost:5432/kcartbot
+   ```
+
+   The chat orchestration now uses DeepSeek (`DEEPSEEK_API_KEY`), while Gemini remains available for image generation and data utilities.
+
+4. Provision databases:
+
+   ```powershell
+   docker run --name kcartbot-postgres -e POSTGRES_DB=kcartbot -e POSTGRES_USER=kcartbot -e POSTGRES_PASSWORD=kcartbot -p 5432:5432 -d postgres:16
+
+   docker run --name kcartbot-milvus -p 19530:19530 -p 9091:9091 -d milvusdb/milvus:v2.4.3-20240813-74fbddb7
+   ```
+
+5. Generate seed data:
+
+   ```powershell
+   uv run -m app.utils.generate_data insert
+   ```
+
+6. Start the application:
+   ```powershell
+   uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+   ```
+
+### Using pip
+
+1. Clone the repository and navigate to the project directory:
+
+   ```powershell
+   git clone https://github.com/AbrehamGebremedhin/KcartBot.git
+   cd KcartBot
+   ```
+
+2. Install dependencies:
+
+   ```powershell
+   pip install -r requirements.txt
+   ```
+
+3. Set up environment variables in `.env`:
+
+   ```dotenv
+   DEEPSEEK_API_KEY=your-deepseek-key
+   GEMINI_API_KEY=your-google-genai-key
+   DATABASE_URL=postgres://kcartbot:kcartbot@localhost:5432/kcartbot
+   ```
+
+   The chat orchestration now uses DeepSeek (`DEEPSEEK_API_KEY`), while Gemini remains available for image generation and data utilities.
+
+4. Provision databases:
+
+   ```powershell
+   docker run --name kcartbot-postgres -e POSTGRES_DB=kcartbot -e POSTGRES_USER=kcartbot -e POSTGRES_PASSWORD=kcartbot -p 5432:5432 -d postgres:16
+
+   docker run --name kcartbot-milvus -p 19530:19530 -p 9091:9091 -d milvusdb/milvus:v2.4.3-20240813-74fbddb7
+   ```
+
+5. Generate seed data:
+
+   ```powershell
+   python -m app.utils.generate_data insert
+   ```
+
+6. Start the application:
+   ```powershell
+   python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+   ```
+
+## Prerequisites
+
+- Python 3.13 (recommended) or 3.11+
+- [uv](https://docs.astral.sh/uv/) package/dependency manager (`pip install uv`)
+- Running services:
+  - PostgreSQL 15+ (`postgres://` connection string)
+  - Milvus standalone 2.4.x (vector search)
+- Google Gemini API key with access to `text-embedding-004` and `gemini-2.5-flash-image`
+
 ## Architecture
 
 ![KcartBot architecture diagram](architecture.png)
@@ -45,70 +146,6 @@ The system processes user interactions through a structured data flow designed f
 8. **Response Delivery**: Final responses are streamed back through the API to the user client.
 
 This flow ensures secure, efficient handling of conversational commerce tasks while isolating concerns across layers.
-
-## Prerequisites
-
-- Python 3.13 (recommended) or 3.11+
-- [uv](https://docs.astral.sh/uv/) package/dependency manager (`pip install uv`)
-- Running services:
-  - PostgreSQL 15+ (`postgres://` connection string)
-  - Milvus standalone 2.4.x (vector search)
-- Google Gemini API key with access to `text-embedding-004` and `gemini-2.5-flash-image`
-
-## Local Setup
-
-1. **Clone & enter project**
-
-   ```powershell
-   git clone https://github.com/AbrehamGebremedhin/KcartBot.git
-   cd KcartBot
-   ```
-
-2. **Create `.env`** (adjust values to your environment):
-
-   ```dotenv
-   DEEPSEEK_API_KEY=your-deepseek-key
-   GEMINI_API_KEY=your-google-genai-key
-   DATABASE_URL=postgres://kcartbot:kcartbot@localhost:5432/kcartbot
-   ```
-
-   The chat orchestration now uses DeepSeek (`DEEPSEEK_API_KEY`), while Gemini remains available for image generation and data utilities.
-
-3. **Provision databases** (example Docker commands):
-
-   ```powershell
-   docker run --name kcartbot-postgres -e POSTGRES_DB=kcartbot -e POSTGRES_USER=kcartbot -e POSTGRES_PASSWORD=kcartbot -p 5432:5432 -d postgres:16
-
-   docker run --name kcartbot-milvus -p 19530:19530 -p 9091:9091 -d milvusdb/milvus:v2.4.3-20240813-74fbddb7
-   ```
-
-   > Tip: Use Docker volumes for persistent data in non-demo environments.
-
-4. **Install project dependencies**
-
-   ```powershell
-   uv sync
-   ```
-
-5. **Generate seed data and embeddings** (ensures schema, populates PostgreSQL + Milvus):
-
-   ```powershell
-   uv run -m app.utils.generate_data insert
-   ```
-
-   - Verifies PostgreSQL database, creates tables when empty.
-   - Inserts mock products, users, supplier inventory, competitor pricing, transactions.
-   - Splits `data/Context.pdf` into embeddings and loads them into Milvus (`KCartBot` collection).
-
-   Re-run with `uv run -m app.utils.generate_data check` to inspect counts without re-inserting.
-
-6. **Start the API**
-
-   ```powershell
-   uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-   ```
-
-   `http://localhost:8000/docs` exposes interactive Swagger for the chat endpoint.
 
 ## Usage Script (End-to-End Test)
 
@@ -158,6 +195,10 @@ All interactions hit `POST /api/v1/chat` with a stable `session_id`. Suggested f
    - Ask odd fact: `"Summarise the sourcing policy"` → expect RAG response; follow with `"Where did that info come from?"` to see if agent references retrieved metadata.
 
 Each step exercises classifier-first routing, relational reads/writes, analytics, flash sale tooling, Milvus RAG, and Gemini image generation. Inspect logs or the `trace` payload to confirm intended tool usage.
+
+## Example Conversations
+
+For real-world examples of customer and supplier interactions, see the `customer.json` and `supplier.json` files in the project root. These contain full conversation flows demonstrating multilingual support, intent classification, tool execution, and seamless dialogue handling.
 
 ## Operational Notes
 
