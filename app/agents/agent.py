@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.llm_service import LLMService
@@ -13,6 +14,7 @@ from app.tools.date_tool import DateResolverTool
 from app.tools.generate_image import ImageGeneratorTool
 from app.tools.intent_classifier import IntentClassifierTool
 from app.tools.search_context import VectorSearchTool
+from app.agents.multilingual_responses import get_multilingual_response_dictionary
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,105 @@ class Agent:
             "image_generator": self.image_generator,
         }
 
+    def _detect_language(self, text: str) -> str:
+        """
+        Detect the language of the input text.
+        
+        Returns:
+            'amharic' for Amharic script (አማርኛ)
+            'phonetic_amharic' for phonetic/latinized Amharic (e.g., "selam", "neger")
+            'english' for English
+        """
+        if not text or not text.strip():
+            return "english"  # Default fallback
+        
+        text = text.strip()
+        
+        # Check for Amharic script characters (Ethiopic script)
+        # Amharic uses characters in the range U+1200 to U+137F
+        amharic_chars = sum(1 for char in text if '\u1200' <= char <= '\u137f')
+        total_chars = len(text.replace(' ', ''))
+        
+        if amharic_chars > total_chars * 0.3:  # More than 30% Amharic characters
+            return "amharic"
+        
+        # Check for phonetic Amharic patterns
+        # Common phonetic Amharic words and patterns
+        phonetic_amharic_indicators = [
+            # Greetings
+            r'\b(selam|salam|tena|tenayistilign|dehna|dehna hun|selam neger|neger)\b',
+            # Common words
+            r'\b(ine|min|ande|neger|ay|aydelem|meskerem|tikimt|betam|nech|min chu|ey|eyu|konjo|min alebet|min lij|min lijoch)\b',
+            # Question words
+            r'\b(min|ande|yet|lema|ke|kem|kena|ken|kegna|kegne|kegnal|kegnaleh)\b',
+            # Numbers in phonetic
+            r'\b(and|hulet|hulet and|sost|arba|arba and|arba sost|arba arba|ammist|ammist and)\b',
+            # Common phrases
+            r'\b(neger ale|neger lij|neger lijoch|betam neger|betam lij|betam lijoch)\b',
+            # Product related
+            r'\b(tomato|mango|orange|banana|potato|onion|garlic|pepper|carrot|cabbage|lettuce|spinach)\b',
+            # Units
+            r'\b(kilo|kg|liter|liters|quintal|ton)\b'
+        ]
+        
+        # Check if text matches phonetic patterns
+        combined_pattern = '|'.join(f'(?:{pattern})' for pattern in phonetic_amharic_indicators)
+        if re.search(combined_pattern, text.lower(), re.IGNORECASE):
+            return "phonetic_amharic"
+        
+        # Additional check: if text contains many common Amharic syllable patterns
+        # Amharic syllables often end with specific patterns
+        amharic_syllable_patterns = [
+            r'\b\w*[aeiou][aeiou]\w*\b',  # Double vowels (common in phonetic Amharic)
+            r'\b\w*esh\w*\b',  # Common ending
+            r'\b\w*och\w*\b',  # Common ending
+            r'\b\w*gn\w*\b',   # Common consonant combination
+            r'\b\w*ch\w*\b',   # Common consonant combination
+            r'\b\w*sh\w*\b',   # Common consonant combination
+        ]
+        
+        phonetic_matches = 0
+        for pattern in amharic_syllable_patterns:
+            if re.search(pattern, text.lower()):
+                phonetic_matches += 1
+        
+        # If multiple phonetic patterns match, likely phonetic Amharic
+        if phonetic_matches >= 2:
+            return "phonetic_amharic"
+        
+        # Default to English
+        return "english"
+
+    def _get_multilingual_response(self, key: str, language: str, **kwargs) -> str:
+        """
+        Get a multilingual response based on the language.
+        
+        Args:
+            key: The response key
+            language: The detected language ('amharic', 'phonetic_amharic', 'english')
+            **kwargs: Format arguments for the response
+        """
+        responses = self._get_response_dictionary()
+        
+        if key not in responses:
+            logger.warning(f"Response key '{key}' not found in multilingual dictionary")
+            return f"Response key '{key}' not found."
+        
+        response_dict = responses[key]
+        response_text = response_dict.get(language, response_dict.get('english', f"Missing response for key: {key}"))
+        
+        if kwargs:
+            try:
+                response_text = response_text.format(**kwargs)
+            except (KeyError, ValueError) as e:
+                logger.warning(f"Failed to format response '{key}' with kwargs {kwargs}: {e}")
+        
+        return response_text
+
+    def _get_response_dictionary(self) -> Dict[str, Dict[str, str]]:
+        """Get the complete multilingual response dictionary."""
+        return get_multilingual_response_dictionary()
+
     async def process_message(
         self,
         user_message: str,
@@ -60,6 +161,11 @@ class Agent:
 
             # Extract chat history
             chat_history = session_context.get("chat_history", [])
+
+            # Detect language from user message
+            detected_language = self._detect_language(user_message)
+            session_context["detected_language"] = detected_language
+            logger.info(f"Detected language: {detected_language}")
 
             # Step 1: Classify intent
             intent_result = await self.intent_classifier.run(
@@ -86,7 +192,7 @@ class Agent:
 
             # Step 2: Handle the conversation based on flow and intent
             if flow == "unknown" or intent == "intent.unknown":
-                response = await self._handle_unknown_intent(user_message, chat_history)
+                response = await self._handle_unknown_intent(user_message, chat_history, detected_language)
             elif flow == "customer":
                 response = await self._handle_customer_flow(
                     intent, filled_slots, missing_slots, suggested_tools, session_context
@@ -100,7 +206,7 @@ class Agent:
                     intent, filled_slots, missing_slots, suggested_tools, session_context
                 )
             else:
-                response = "I'm sorry, I couldn't understand your request. Could you please clarify?"
+                response = self._get_multilingual_response("error_unknown", detected_language)
 
             # Step 3: Update chat history
             chat_history.append({"role": "user", "content": user_message})
@@ -125,20 +231,26 @@ class Agent:
 
         except Exception as exc:
             logger.error(f"Error processing message: {exc}")
+            detected_language = session_context.get("detected_language", "english") if session_context else "english"
             return {
-                "response": "I'm sorry, I encountered an error. Please try again.",
+                "response": self._get_multilingual_response("error_generic", detected_language),
                 "session_context": session_context or {},
                 "error": str(exc)
             }
 
     async def _handle_unknown_intent(
-        self, user_message: str, chat_history: List[Dict[str, str]]
+        self, user_message: str, chat_history: List[Dict[str, str]], language: str = "english"
     ) -> str:
         """Handle unknown intents by asking for clarification."""
         # Check for simple greetings
         greeting_words = ["hello", "hi", "hey", "good morning", "good afternoon", "good evening", "greetings"]
-        if any(word in user_message.lower() for word in greeting_words):
-            return "Hello! Welcome to KCartBot, your fresh produce marketplace assistant. Are you a customer looking to place an order, or a supplier managing inventory?"
+        phonetic_greetings = ["selam", "salam", "tenayistilign", "dehna", "dehna hun"]
+        amharic_greetings = ["ሰላም", "ጤና ይስጥልኝ", "ደህና"]
+        
+        all_greetings = greeting_words + phonetic_greetings + amharic_greetings
+        
+        if any(word in user_message.lower() for word in all_greetings):
+            return self._get_multilingual_response("greeting", language)
 
         # Check if this might be a confirmation of previous context
         if chat_history:
@@ -148,30 +260,10 @@ class Agent:
                     last_assistant_msg = msg.get("content", "")
                     break
 
-            if any(word in user_message.lower() for word in ["yes", "okay", "sure", "go ahead", "confirm"]):
-                return "Great! Could you please provide more details about what you'd like to do?"
+            if any(word in user_message.lower() for word in ["yes", "okay", "sure", "go ahead", "confirm", "aw", "ey", "eyu"]):
+                return self._get_multilingual_response("confirmation_response", language)
 
-    async def _handle_unknown_intent(
-        self, user_message: str, chat_history: List[Dict[str, str]]
-    ) -> str:
-        """Handle unknown intents by asking for clarification."""
-        # Check for simple greetings
-        greeting_words = ["hello", "hi", "hey", "good morning", "good afternoon", "good evening", "greetings"]
-        if any(word in user_message.lower() for word in greeting_words):
-            return "Hello! Welcome to KCartBot, your fresh produce marketplace assistant. Are you a customer looking to place an order, or a supplier managing inventory?"
-
-        # Check if this might be a confirmation of previous context
-        if chat_history:
-            last_assistant_msg = None
-            for msg in reversed(chat_history):
-                if msg.get("role") == "assistant":
-                    last_assistant_msg = msg.get("content", "")
-                    break
-
-            if any(word in user_message.lower() for word in ["yes", "okay", "sure", "go ahead", "confirm"]):
-                return "Great! Could you please provide more details about what you'd like to do?"
-
-        return "I'm not sure what you mean. Are you a customer looking to place an order, or a supplier managing inventory?"
+        return self._get_multilingual_response("unknown_intent", language)
 
     async def _handle_customer_flow(
         self,
@@ -182,6 +274,8 @@ class Agent:
         session_context: Dict[str, Any]
     ) -> str:
         """Handle customer flow intents."""
+        language = session_context.get("detected_language", "english")
+        
         try:
             if intent == "intent.customer.register":
                 return await self._handle_customer_registration(filled_slots, missing_slots, session_context)
@@ -220,11 +314,11 @@ class Agent:
                 return await self._handle_customer_check_deliveries(filled_slots, session_context)
 
             else:
-                return "I'm here to help with your fresh produce needs. What would you like to do?"
+                return self._get_multilingual_response("error_unknown", language)
 
         except Exception as exc:
             logger.error(f"Error in customer flow: {exc}")
-            return "I encountered an issue processing your request. Please try again."
+            return self._get_multilingual_response("error_generic", language)
 
     async def _handle_supplier_flow(
         self,
@@ -234,6 +328,7 @@ class Agent:
         suggested_tools: List[str],
         session_context: Dict[str, Any]
     ) -> str:
+        language = session_context.get("detected_language", "english")
         """Handle supplier flow intents."""
         try:
             if intent == "intent.supplier.register":
@@ -293,12 +388,12 @@ class Agent:
             elif intent == "intent.customer.nutrition_query":
                 return await self._handle_nutrition_query(filled_slots, session_context)
 
-            else:
-                return "I'm here to help you manage your inventory and sales. What would you like to do?"
+            else:                
+                return self._get_multilingual_response("error_supplier", language)
 
         except Exception as exc:
             logger.error(f"Error in supplier flow: {exc}")
-            return "I encountered an issue processing your request. Please try again."
+            return self._get_multilingual_response("error_generic", language)
 
     async def _handle_onboarding_flow(
         self,
@@ -309,21 +404,23 @@ class Agent:
         session_context: Dict[str, Any]
     ) -> str:
         """Handle user onboarding flow."""
+        language = session_context.get("detected_language", "english")
+        
         try:
             if intent == "intent.user.is_customer":
                 session_context["user_role"] = "customer"
-                return "Great! Are you a new customer or do you already have an account with us?"
+                return self._get_multilingual_response("is_customer", language)
 
             elif intent == "intent.user.is_supplier":
                 session_context["user_role"] = "supplier"
-                return "Excellent! Are you a new supplier or do you already have an account with us?"
+                return self._get_multilingual_response("is_supplier", language)
 
             elif intent == "intent.user.has_account":
                 user_role = session_context.get("user_role")
                 if not user_role:
-                    return "Please tell me if you're a customer or supplier first."
+                    return self._get_multilingual_response("unknown_intent", language)
 
-                return f"I see you already have an account. What's your name and phone number so I can verify your {user_role} account?"
+                return self._get_multilingual_response("has_account", language, user_role=user_role)
 
             elif intent == "intent.user.new_user":
                 return await self._handle_new_user_registration(filled_slots, session_context)
@@ -332,23 +429,25 @@ class Agent:
                 return await self._handle_account_verification(filled_slots, session_context)
 
             else:
-                return "I'm not sure about that. Are you a customer or supplier?"
+                return self._get_multilingual_response("unknown_intent", language)
 
         except Exception as exc:
             logger.error(f"Error in onboarding flow: {exc}")
-            return "I encountered an issue during onboarding. Please try again."
+            return self._get_multilingual_response("error_generic", language)
 
     # Onboarding flow handlers
     async def _handle_account_verification(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Handle verification of existing user account."""
+        language = session_context.get("detected_language", "english")
+        
         user_name = filled_slots.get("user_name")
         phone_number = filled_slots.get("phone_number")
         user_role = session_context.get("user_role")
 
         if not user_name or not phone_number:
-            return "I need both your name and phone number to verify your account."
+            return self._get_multilingual_response("need_name_phone", language)
 
         try:
             # Check if user exists in database
@@ -365,17 +464,17 @@ class Agent:
                 session_context["authenticated"] = True
 
                 if user_role == "customer":
-                    return f"Welcome back, {user_name}! Your customer account has been verified. How can I help you with your fresh produce needs today?"
+                    return self._get_multilingual_response("account_verified_customer", language, user_name=user_name)
                 else:
                     # Supplier dashboard - show pending orders and expiring products
                     dashboard_info = await self._get_supplier_dashboard_info(user["user_id"])
-                    return f"Welcome back, {user_name}! Your supplier account has been verified. {dashboard_info} How can I help you manage your inventory today?"
+                    return self._get_multilingual_response("account_verified_supplier", language, user_name=user_name, dashboard_info=dashboard_info)
             else:
-                return f"I couldn't find an account with that name and phone number. Would you like to create a new {user_role} account instead?"
+                return self._get_multilingual_response("account_not_found", language, user_role=user_role)
 
         except Exception as exc:
             logger.error(f"Failed to verify account: {exc}")
-            return "I couldn't verify your account right now. Please try again."
+            return self._get_multilingual_response("error_generic", language)
 
     async def _get_supplier_dashboard_info(self, supplier_id: int) -> str:
         """Get dashboard information for supplier login."""
@@ -568,9 +667,11 @@ class Agent:
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Handle registration of new user."""
+        language = session_context.get("detected_language", "english")
+        
         user_role = session_context.get("user_role")
         if not user_role:
-            return "Please tell me if you're a customer or supplier first."
+            return self._get_multilingual_response("unknown_intent", language)
 
         if user_role == "customer":
             user_name = filled_slots.get("customer_name")
@@ -578,11 +679,11 @@ class Agent:
             default_location = filled_slots.get("default_location")
 
             if not user_name:
-                return "What's your name?"
+                return self._get_multilingual_response("ask_customer_name", language)
             if not phone_number:
-                return "What's your phone number?"
+                return self._get_multilingual_response("ask_phone_number", language)
             if not default_location:
-                return "What's your default delivery location?"
+                return self._get_multilingual_response("ask_default_location", language)
 
             try:
                 result = await self.database_tool.run({
@@ -593,27 +694,27 @@ class Agent:
                         "name": user_name,
                         "phone": phone_number,
                         "default_location": default_location,
-                        "preferred_language": "English",  # Default language
+                        "preferred_language": language,  # Store detected language
                         "role": "customer",
                         "joined_date": datetime.date.today()  # Explicitly set joined date
                     }
                 })
                 session_context["user_id"] = result.get("user_id")
                 session_context["authenticated"] = True
-                return f"Welcome {user_name}! Your customer account has been created. How can I help you with your fresh produce needs today?"
+                return self._get_multilingual_response("customer_registered", language, customer_name=user_name)
 
             except Exception as exc:
                 logger.error(f"Failed to register customer: {exc}")
-                return "I couldn't create your account. Please try again."
+                return self._get_multilingual_response("registration_failed", language)
 
         else:  # supplier
             supplier_name = filled_slots.get("supplier_name")
             phone_number = filled_slots.get("phone_number")
 
             if not supplier_name:
-                return "What's your business name?"
+                return self._get_multilingual_response("ask_business_name", language)
             if not phone_number:
-                return "What's your phone number?"
+                return self._get_multilingual_response("ask_phone_number", language)
 
             try:
                 result = await self.database_tool.run({
@@ -624,32 +725,34 @@ class Agent:
                         "name": supplier_name,
                         "phone": phone_number,
                         "default_location": "",  # Suppliers don't need a default location
-                        "preferred_language": "English",  # Default language
+                        "preferred_language": language,  # Store detected language
                         "role": "supplier",
                         "joined_date": datetime.date.today()  # Explicitly set joined date
                     }
                 })
                 session_context["user_id"] = result.get("user_id")
                 session_context["authenticated"] = True
-                return f"Welcome {supplier_name}! Your supplier account has been created. How can I help you manage your inventory today?"
+                return self._get_multilingual_response("supplier_registered", language, supplier_name=supplier_name)
 
             except Exception as exc:
                 logger.error(f"Failed to register supplier: {exc}")
-                return "I couldn't create your account. Please try again."
+                return self._get_multilingual_response("registration_failed", language)
 
     # Customer flow handlers
     async def _handle_customer_registration(
         self, filled_slots: Dict[str, Any], missing_slots: List[str], session_context: Dict[str, Any]
     ) -> str:
         """Handle customer registration."""
+        language = session_context.get("detected_language", "english")
+        
         if missing_slots:
             slot = missing_slots[0]
             if slot == "customer_name":
-                return "Welcome! What's your name?"
+                return self._get_multilingual_response("ask_customer_name", language)
             elif slot == "phone_number":
-                return "Great! What's your phone number?"
+                return self._get_multilingual_response("ask_phone_number", language)
             elif slot == "default_location":
-                return "Perfect! What's your default delivery location?"
+                return self._get_multilingual_response("ask_default_location", language)
 
         # All slots filled, register the customer
         try:
@@ -661,24 +764,26 @@ class Agent:
                     "name": filled_slots["customer_name"],
                     "phone": filled_slots["phone_number"],
                     "default_location": filled_slots["default_location"],
-                    "preferred_language": "English",  # Default language
+                    "preferred_language": language,  # Store detected language
                     "role": "customer",
                     "joined_date": datetime.date.today()  # Explicitly set joined date
                 }
             })
             session_context["user_id"] = result.get("user_id")
-            return f"Welcome {filled_slots['customer_name']}! Your account has been created. How can I help you today?"
+            return self._get_multilingual_response("customer_registered", language, customer_name=filled_slots['customer_name'])
         except Exception as exc:
             logger.error(f"Failed to register customer: {exc}")
-            return "I couldn't create your account. Please try again."
+            return self._get_multilingual_response("registration_failed", language)
 
     async def _handle_product_availability(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Check product availability."""
+        language = session_context.get("detected_language", "english")
+        
         product_name = filled_slots.get("product_name")
         if not product_name:
-            return "What product are you looking for?"
+            return self._get_multilingual_response("what_product", language)
 
         try:
             # First, try to find the product by name
@@ -704,10 +809,10 @@ class Agent:
                         available_products.append(item)
 
                 if not available_products:
-                    return f"Sorry, {product_name} is currently out of stock."
+                    return self._get_multilingual_response("product_not_available", language, product_name=product_name)
 
                 # Show available options
-                response_parts = [f"Yes, {product_name} is available from:"]
+                response_parts = [self._get_multilingual_response("product_available", language, product_name=product_name)]
                 for item in available_products[:3]:  # Show up to 3 options
                     supplier_name = item.get("supplier", {}).get("name", "Unknown supplier")
                     price = item.get("unit_price_etb", 0)
@@ -740,13 +845,13 @@ class Agent:
                         available_products.append(item)
 
                 if not available_products:
-                    return f"Sorry, {product_name} doesn't have any products available right now."
+                    return self._get_multilingual_response("supplier_no_products", language, supplier_name=product_name)
 
                 # Set supplier_id in session context for future orders
                 session_context["supplier_id"] = supplier["user_id"]
 
                 # Show products from this supplier
-                response_parts = [f"Products available from {product_name}:"]
+                response_parts = [self._get_multilingual_response("supplier_products", language, supplier_name=product_name)]
                 for item in available_products[:5]:  # Show up to 5 products
                     product_name_display = item.get("product", {}).get("product_name_en", "Unknown product")
                     price = item.get("unit_price_etb", 0)
@@ -757,19 +862,21 @@ class Agent:
                 return " ".join(response_parts)
 
             # Neither product nor supplier found
-            return f"Sorry, {product_name} is not currently available."
+            return self._get_multilingual_response("product_not_available", language, product_name=product_name)
 
         except Exception as exc:
             logger.error(f"Failed to check availability: {exc}")
-            return "I couldn't check availability right now. Please try again."
+            return self._get_multilingual_response("error_generic", language)
 
     async def _handle_storage_advice(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Provide storage advice using RAG (Retrieval-Augmented Generation)."""
+        language = session_context.get("detected_language", "english")
+        
         product_name = filled_slots.get("product_name")
         if not product_name:
-            return "What product do you need storage advice for?"
+            return self._get_multilingual_response("what_product_storage", language)
 
         try:
             # First, find the product in the database to get its English name
@@ -816,7 +923,7 @@ class Agent:
             rag_prompt = f"""
 You are a food storage expert providing objective storage advice. Do not mention ordering, marketplace, suppliers, customers, or KCartBot. Focus only on storage recommendations.
 
-Based on the following storage information, provide helpful and practical advice for storing {product_name}.
+Based on the following storage information, provide helpful and practical advice for storing {product_name}. 
 
 Storage Information:
 {context_combined}
@@ -844,11 +951,12 @@ Please provide clear, concise storage advice that incorporates the relevant info
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Handle nutrition comparison queries using RAG."""
+        language = session_context.get("detected_language", "english")
         product_a = filled_slots.get("product_a")
         product_b = filled_slots.get("product_b")
 
         if not product_a or not product_b:
-            return "Which two products would you like to compare nutritionally?"
+            return self._get_multilingual_response("nutrition_query_missing_products", language)
 
         try:
             # Get English names for both products
@@ -872,7 +980,7 @@ Please provide clear, concise storage advice that incorporates the relevant info
             })
 
             if context.get("error") or not context.get("results"):
-                return f"I don't have specific nutritional data comparing {product_a} and {product_b}."
+                return self._get_multilingual_response("nutrition_no_data", language, product_a=product_a, product_b=product_b)
 
             # Extract relevant text from results
             context_texts = []
@@ -882,7 +990,7 @@ Please provide clear, concise storage advice that incorporates the relevant info
                     context_texts.append(text)
 
             if not context_texts:
-                return f"I don't have specific nutritional data comparing {product_a} and {product_b}."
+                return self._get_multilingual_response("nutrition_no_data", language, product_a=product_a, product_b=product_b)
 
             # Use RAG: Combine retrieved context with LLM generation
             context_combined = "\n".join(context_texts)
@@ -914,12 +1022,13 @@ Please provide a clear, balanced nutritional comparison that highlights the key 
 
         except Exception as exc:
             logger.error(f"Failed to get nutrition info: {exc}")
-            return f"I couldn't find nutritional information comparing {product_a} and {product_b}."
+            return self._get_multilingual_response("nutrition_error", language, product_a=product_a, product_b=product_b)
 
     async def _handle_seasonal_query(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Handle seasonal availability queries using RAG."""
+        language = session_context.get("detected_language", "english")
         season = filled_slots.get("season")
         location = filled_slots.get("location")
 
@@ -939,7 +1048,7 @@ Please provide a clear, balanced nutritional comparison that highlights the key 
             })
 
             if context.get("error") or not context.get("results"):
-                return "I don't have specific seasonal information right now."
+                return self._get_multilingual_response("seasonal_not_found", language)
 
             # Extract relevant text from results
             context_texts = []
@@ -949,7 +1058,7 @@ Please provide a clear, balanced nutritional comparison that highlights the key 
                     context_texts.append(text)
 
             if not context_texts:
-                return "I don't have specific seasonal information in my knowledge base right now."
+                return self._get_multilingual_response("seasonal_no_data", language)
 
             # Use RAG: Combine retrieved context with LLM generation
             context_combined = "\n".join(context_texts)
@@ -976,16 +1085,17 @@ Please provide clear, organized information about seasonal produce availability.
                 return llm_response.strip()
             else:
                 # Fallback to direct context
-                return f"Seasonal information: {context_texts[0]}"
+                return self._get_multilingual_response("seasonal_fallback", language, context=context_texts[0])
 
         except Exception as exc:
             logger.error(f"Failed to get seasonal info: {exc}")
-            return "I couldn't find seasonal availability information."
+            return self._get_multilingual_response("seasonal_error", language)
 
     async def _handle_in_season_query(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Handle 'what's in season' queries using RAG."""
+        language = session_context.get("detected_language", "english")
         location = filled_slots.get("location")
         query = "what produce is currently in season"
         if location:
@@ -1001,7 +1111,7 @@ Please provide clear, organized information about seasonal produce availability.
             })
 
             if context.get("error") or not context.get("results"):
-                return "I don't have current seasonal information."
+                return self._get_multilingual_response("seasonal_not_found", language)
 
             # Extract relevant text from results
             context_texts = []
@@ -1011,7 +1121,7 @@ Please provide clear, organized information about seasonal produce availability.
                     context_texts.append(text)
 
             if not context_texts:
-                return "I don't have current seasonal information in my knowledge base right now."
+                return self._get_multilingual_response("seasonal_no_data", language)
 
             # Use RAG: Combine retrieved context with LLM generation
             context_combined = "\n".join(context_texts)
@@ -1038,19 +1148,20 @@ Please provide clear, organized information about produce that is currently in s
                 return llm_response.strip()
             else:
                 # Fallback to direct context
-                return f"Currently in season: {context_texts[0]}"
+                return self._get_multilingual_response("seasonal_fallback", language, context=context_texts[0])
 
         except Exception as exc:
             logger.error(f"Failed to get in-season info: {exc}")
-            return "I couldn't find information about what's currently in season."
+            return self._get_multilingual_response("seasonal_error", language)
 
     async def _handle_general_advisory(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Handle general product advisory questions using RAG."""
+        language = session_context.get("detected_language", "english")
         question = filled_slots.get("question")
         if not question:
-            return "What question do you have about our products?"
+            return self._get_multilingual_response("general_advisory_no_query", language)
 
         try:
             # Retrieve relevant context
@@ -1060,7 +1171,7 @@ Please provide clear, organized information about produce that is currently in s
             })
 
             if context.get("error") or not context.get("results"):
-                return "I don't have information about that topic."
+                return self._get_multilingual_response("general_advisory_not_found", language)
 
             # Extract relevant text from results
             context_texts = []
@@ -1070,7 +1181,7 @@ Please provide clear, organized information about produce that is currently in s
                     context_texts.append(text)
 
             if not context_texts:
-                return "I don't have information about that topic in my knowledge base right now."
+                return self._get_multilingual_response("general_advisory_no_data", language)
 
             # Use RAG: Combine retrieved context with LLM generation
             context_combined = "\n".join(context_texts)
@@ -1097,23 +1208,24 @@ Please provide a clear, helpful answer that addresses the user's question using 
                 return llm_response.strip()
             else:
                 # Fallback to direct context
-                return f"Here's what I know: {context_texts[0]}"
+                return self._get_multilingual_response("general_advisory_fallback", language, context=context_texts[0])
 
         except Exception as exc:
             logger.error(f"Failed to get advisory info: {exc}")
-            return "I couldn't find information about that."
+            return self._get_multilingual_response("general_advisory_error", language)
 
     async def _handle_place_order(
         self, filled_slots: Dict[str, Any], missing_slots: List[str], session_context: Dict[str, Any]
     ) -> str:
         """Handle order placement."""
+        language = session_context.get("detected_language", "english")
         user_id = session_context.get("user_id")
         if not user_id:
-            return "Please register first before placing an order."
+            return self._get_multilingual_response("register_first", language)
 
         order_items = filled_slots.get("order_items", [])
         if not order_items:
-            return "What would you like to order?"
+            return self._get_multilingual_response("what_order", language)
 
         # Handle case where order_items is a string (product name) instead of list
         if isinstance(order_items, str):
@@ -1136,9 +1248,9 @@ Please provide a clear, helpful answer that addresses the user's question using 
         # Check if we have missing slots that need to be filled
         if missing_slots:
             if "quantity" in missing_slots:
-                return "How much would you like to order?"
+                return self._get_multilingual_response("how_much", language)
             elif "preferred_delivery_date" in missing_slots:
-                return "When would you like this delivered?"
+                return self._get_multilingual_response("when_delivery", language)
 
         try:
             # Create the order
@@ -1171,7 +1283,7 @@ Please provide a clear, helpful answer that addresses the user's question using 
                 })
 
                 if not product:
-                    return f"Sorry, {product_name} is not available."
+                    return self._get_multilingual_response("product_not_available", language, product_name=product_name)
 
                 # Get supplier products for this product
                 supplier_id = session_context.get("supplier_id")
@@ -1191,14 +1303,14 @@ Please provide a clear, helpful answer that addresses the user's question using 
                     })
 
                 if not supplier_products:
-                    return f"Sorry, {product_name} is not available."
+                    return self._get_multilingual_response("product_not_available", language, product_name=product_name)
 
                 # Use first available supplier for now
                 supplier_product = supplier_products[0]
                 available_quantity = supplier_product.get("quantity_available", 0)
                 
                 if total_quantity > available_quantity:
-                    return f"Sorry, only {available_quantity} {supplier_product.get('unit', 'kg')} of {product_name} is available from the selected supplier."
+                    return self._get_multilingual_response("insufficient_quantity", language, product_name=product_name, available_quantity=available_quantity, unit=supplier_product.get('unit', 'kg'))
                 
                 unit_price = supplier_product.get("unit_price_etb", 0)
                 subtotal = total_quantity * unit_price
@@ -1224,7 +1336,7 @@ Please provide a clear, helpful answer that addresses the user's question using 
             })
 
             if not user_instance:
-                return "User not found. Please register first."
+                return self._get_multilingual_response("user_not_found", language)
 
             # Handle delivery date if provided
             delivery_date = filled_slots.get("delivery_date") or filled_slots.get("preferred_delivery_date")
@@ -1273,7 +1385,7 @@ Please provide a clear, helpful answer that addresses the user's question using 
 
                 if not product_instance or not supplier_instance:
                     logger.error(f"Failed to get product or supplier instances: product_instance={product_instance}, supplier_instance={supplier_instance}")
-                    return "Product or supplier information not found."
+                    return self._get_multilingual_response("product_supplier_not_found", language)
 
                 logger.info(f"Creating order item with order={transaction}, product={product_instance}, supplier={supplier_instance}")
                 await self.database_tool.run({
@@ -1302,28 +1414,30 @@ Please provide a clear, helpful answer that addresses the user's question using 
                 })
                 logger.info(f"Updated supplier inventory: {supplier_product['inventory_id']} now has {new_quantity} {detail['unit']} available")
 
-            return f"Order placed successfully! Total: {total_price} ETB. Payment will be Cash on Delivery."
+            return self._get_multilingual_response("order_placed", language, total_price=total_price)
 
         except Exception as exc:
             logger.error(f"Failed to place order: {exc}")
-            return "I couldn't place your order. Please try again."
+            return self._get_multilingual_response("order_failed", language)
 
     async def _handle_set_delivery_date(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
+        language = session_context.get("detected_language", "english")
         """Handle delivery date setting."""
         delivery_date = filled_slots.get("delivery_date")
         if not delivery_date:
-            return "When would you like your delivery?"
+            return self._get_multilingual_response("when_delivery_date", language)
 
         try:
+            language = session_context.get("detected_language", "english")
             # Resolve the date
             resolved_date = await self.date_resolver.run(delivery_date)
 
             # Update the most recent pending order
             user_id = session_context.get("user_id")
             if not user_id:
-                return "Please register first."
+                return self._get_multilingual_response("register_first", language)
 
             orders = await self.database_tool.run({
                 "table": "transactions",
@@ -1333,7 +1447,7 @@ Please provide a clear, helpful answer that addresses the user's question using 
             })
 
             if not orders:
-                return "You don't have any pending orders."
+                return self._get_multilingual_response("no_deliveries", language)
 
             latest_order = orders[0]  # Assuming sorted by date desc
 
@@ -1344,45 +1458,47 @@ Please provide a clear, helpful answer that addresses the user's question using 
                 "kwargs": {"delivery_date": resolved_date.isoformat()}
             })
 
-            return f"Delivery date set to {resolved_date.strftime('%B %d, %Y')}."
+            return self._get_multilingual_response("delivery_date_set", language, delivery_date=resolved_date.strftime('%B %d, %Y'))
 
         except Exception as exc:
             logger.error(f"Failed to set delivery date: {exc}")
-            return "I couldn't set the delivery date. Please try again."
+            return self._get_multilingual_response("delivery_date_failed", language)
 
     async def _handle_set_delivery_location(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Handle delivery location setting."""
+        language = session_context.get("detected_language", "english")
         location = filled_slots.get("delivery_location")
         if not location:
-            return "Where would you like your delivery?"
+            return self._get_multilingual_response("where_delivery", language)
 
         # For now, just acknowledge - in practice might need validation
-        return f"Delivery location set to {location}."
+        return self._get_multilingual_response("delivery_location_set", language, location=location)
 
     async def _handle_confirm_payment(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Handle payment confirmation."""
+        language = session_context.get("detected_language", "english")
         order_ref = filled_slots.get("order_reference")
         if not order_ref:
-            return "Which order would you like to confirm payment for?"
+            return self._get_multilingual_response("which_order_payment", language)
 
         try:
             # Update order status to Confirmed
             await self.database_tool.run({
                 "table": "transactions",
                 "method": "update_transaction",
-                "args": [order_ref],
+                "args": [order_ref], # This assumes order_ref is the ID, which might be incorrect
                 "kwargs": {"status": "Confirmed"}
             })
 
-            return "Payment confirmed! Your order is now being prepared for delivery."
+            return self._get_multilingual_response("payment_confirmed", language)
 
         except Exception as exc:
             logger.error(f"Failed to confirm payment: {exc}")
-            return "I couldn't confirm the payment. Please try again."
+            return self._get_multilingual_response("payment_failed", language)
 
     async def _handle_customer_check_deliveries(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
@@ -1390,7 +1506,7 @@ Please provide a clear, helpful answer that addresses the user's question using 
         """Handle customer checking their deliveries."""
         user_id = session_context.get("user_id")
         if not user_id:
-            return "Please log in as a customer first."
+            return self._get_multilingual_response("register_first", "english") # Should be customer specific
 
         date_filter = filled_slots.get("date")
         order_ref = filled_slots.get("order_reference")
@@ -1405,7 +1521,7 @@ Please provide a clear, helpful answer that addresses the user's question using 
             })
 
             if not transactions:
-                return "You have no deliveries scheduled."
+                return self._get_multilingual_response("no_deliveries", "english")
 
             # If a specific date is requested, filter by delivery date
             if date_filter:
@@ -1425,13 +1541,13 @@ Please provide a clear, helpful answer that addresses the user's question using 
                 transactions = filtered_transactions
 
                 if not transactions:
-                    return f"You have no deliveries scheduled for {resolved_date.strftime('%B %d, %Y')}."
+                    return self._get_multilingual_response("no_deliveries_date", "english", date=resolved_date.strftime('%B %d, %Y'))
 
             # If a specific order reference is requested, filter to that order
             if order_ref:
                 transactions = [t for t in transactions if t.get("order_id", "").startswith(order_ref)]
                 if not transactions:
-                    return f"I couldn't find an order with reference '{order_ref}'."
+                    return f"I couldn't find an order with reference '{order_ref}'." # Needs translation
 
             # Format the response
             response_parts = ["Your deliveries:"]
@@ -1469,19 +1585,21 @@ Please provide a clear, helpful answer that addresses the user's question using 
 
         except Exception as exc:
             logger.error(f"Failed to check customer deliveries: {exc}")
-            return "I couldn't check your deliveries right now. Please try again."
+            return self._get_multilingual_response("deliveries_failed", "english")
 
     # Supplier flow handlers
     async def _handle_supplier_registration(
         self, filled_slots: Dict[str, Any], missing_slots: List[str], session_context: Dict[str, Any]
     ) -> str:
         """Handle supplier registration."""
+        language = session_context.get("detected_language", "english")
+        
         if missing_slots:
             slot = missing_slots[0]
             if slot == "supplier_name":
-                return "Welcome! What's your business name?"
+                return self._get_multilingual_response("ask_business_name", language)
             elif slot == "phone_number":
-                return "Great! What's your phone number?"
+                return self._get_multilingual_response("ask_phone_number", language)
 
         # All slots filled, register the supplier
         try:
@@ -1493,28 +1611,29 @@ Please provide a clear, helpful answer that addresses the user's question using 
                     "name": filled_slots["supplier_name"],
                     "phone": filled_slots["phone_number"],
                     "default_location": "",  # Suppliers don't need a default location
-                    "preferred_language": "English",  # Default language
+                    "preferred_language": language,  # Store detected language
                     "role": "supplier",
                     "joined_date": datetime.date.today()  # Explicitly set joined date
                 }
             })
             session_context["user_id"] = result.get("user_id")
-            return f"Welcome {filled_slots['supplier_name']}! Your supplier account has been created. How can I help you manage your inventory?"
+            return self._get_multilingual_response("supplier_registered", language, supplier_name=filled_slots['supplier_name'])
         except Exception as exc:
             logger.error(f"Failed to register supplier: {exc}")
-            return "I couldn't create your account. Please try again."
+            return self._get_multilingual_response("registration_failed", language)
 
     async def _handle_add_product(
         self, filled_slots: Dict[str, Any], missing_slots: List[str], session_context: Dict[str, Any]
     ) -> str:
         """Handle adding a new product."""
+        language = session_context.get("detected_language", "english")
         user_id = session_context.get("user_id")
         if not user_id:
-            return "Please register as a supplier first."
+            return self._get_multilingual_response("register_first", language)
 
         product_name = filled_slots.get("product_name")
         if not product_name:
-            return "What product would you like to add?"
+            return self._get_multilingual_response("what_product_add", language)
 
         # Check if product exists using any name field
         try:
@@ -1586,25 +1705,26 @@ Please provide a clear, helpful answer that addresses the user's question using 
                     "Reply 'add' to increase existing inventory or 'new' to create a separate listing."
                 )
 
-            return f"Product '{product_name}' is ready. What's the quantity you have available?"
+            return self._get_multilingual_response("what_quantity", language)
 
         except Exception as exc:
             logger.error(f"Failed to add product: {exc}")
-            return "I couldn't add the product. Please try again."
+            return self._get_multilingual_response("error_generic", language)
 
     async def _handle_set_quantity(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Handle setting product quantity."""
+        language = session_context.get("detected_language", "english")
         user_id = session_context.get("user_id")
         if not user_id:
-            return "Please register first."
+            return self._get_multilingual_response("register_first", language)
 
         product_name = filled_slots.get("product_name")
         quantity = filled_slots.get("quantity")
 
         if not product_name or quantity is None:
-            return "What product and how much quantity?"
+            return self._get_multilingual_response("what_quantity", language)
 
         # Check if this supplier already has this product and user wants to add to existing
         user_message = session_context.get("last_user_message", "").lower()
@@ -1687,26 +1807,27 @@ Please provide a clear, helpful answer that addresses the user's question using 
 
                         suggestion_text = f" 📊 **Market Insights for {product_name}:** • Average market price: {avg_price:.1f} ETB/kg • Price range: {min_price:.1f} - {max_price:.1f} ETB/kg • Suggested competitive range: {max(min_price * 0.9, avg_price * 0.85):.1f} - {min(max_price * 1.1, avg_price * 1.15):.1f} ETB/kg"
 
-            return f"I'll add {quantity} kg of {product_name}.{suggestion_text} What's the price per kg in ETB you'd like to set?"
+            return f"I'll add {quantity} kg of {product_name}.{suggestion_text} {self._get_multilingual_response('what_price', language)}"
 
         except Exception as exc:
             logger.error(f"Failed to get pricing suggestions: {exc}")
-            return f"I'll add {quantity} kg of {product_name}. What's the price per kg in ETB?"
+            return f"I'll add {quantity} kg of {product_name}. {self._get_multilingual_response('what_price', language)}"
 
     async def _handle_set_delivery_dates(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Handle setting delivery dates."""
+        language = session_context.get("detected_language", "english")
         delivery_dates = filled_slots.get("delivery_dates")
         pending_product = session_context.get("pending_product")
 
         if not pending_product:
-            return "Please start by adding a product first."
+            return self._get_multilingual_response("error_generic", language)
 
         product_name = pending_product.get("product_name", "this product")
 
         if not delivery_dates:
-            return f"What days can you deliver {product_name}? (e.g., 'Monday to Friday' or 'weekdays')"
+            return self._get_multilingual_response("what_delivery_days", language, product_name=product_name)
 
         # Store delivery dates
         pending_product["delivery_dates"] = delivery_dates
@@ -1714,7 +1835,7 @@ Please provide a clear, helpful answer that addresses the user's question using 
         # Now we have all the information, create the supplier product
         user_id = session_context.get("user_id")
         if not user_id:
-            return "Please register first."
+            return self._get_multilingual_response("register_first", language)
 
         try:
             # Find the product
@@ -1748,7 +1869,7 @@ Please provide a clear, helpful answer that addresses the user's question using 
             })
 
             if not user or not product:
-                return "I couldn't find the required user or product information."
+                return self._get_multilingual_response("error_generic", language)
 
             quantity = pending_product.get("quantity")
             unit_price = pending_product.get("unit_price")
@@ -1919,74 +2040,77 @@ Please provide a clear, helpful answer that addresses the user's question using 
 
         except Exception as exc:
             logger.error(f"Failed to create supplier product: {exc}")
-            return "I couldn't add the product to your inventory. Please try again."
+            return self._get_multilingual_response("error_generic", language)
 
     async def _handle_set_expiry_date(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Handle setting expiry date."""
+        language = session_context.get("detected_language", "english")
         expiry_date_input = filled_slots.get("expiry_date")
         pending_product = session_context.get("pending_product")
 
         if not pending_product:
-            return "Please start by adding a product first."
+            return self._get_multilingual_response("register_first", language)
 
         product_name = pending_product.get("product_name", "this product")
 
         # Handle cases where user says no expiry or similar
         if expiry_date_input and any(word in expiry_date_input.lower() for word in ["no", "none", "doesn't", "never", "no expiry"]):
             pending_product["expiry_date"] = None
-            return f"Noted - {product_name} has no expiry date. What days can you deliver {product_name}? (e.g., 'Monday to Friday' or 'weekdays')"
+            return self._get_multilingual_response("no_expiry_noted", language, product_name=product_name)
 
         if not expiry_date_input:
-            return f"When does {product_name} expire? (You can say 'no expiry' if it doesn't expire)"
+            return self._get_multilingual_response("what_expiry_date", language, product_name=product_name)
 
         try:
             resolved_date = await self.date_resolver.run(expiry_date_input)
             pending_product["expiry_date"] = resolved_date.isoformat()
-            return f"Expiry date set to {resolved_date.strftime('%B %d, %Y')}. What days can you deliver {product_name}? (e.g., 'Monday to Friday' or 'weekdays')"
+            return self._get_multilingual_response("expiry_date_set", language, date=resolved_date.strftime('%B %d, %Y'), product_name=product_name)
         except Exception as exc:
             logger.error(f"Failed to resolve expiry date: {exc}")
             # Store the raw input if date resolution fails
             pending_product["expiry_date"] = expiry_date_input
-            return f"Expiry date noted as: {expiry_date_input}. What days can you deliver {product_name}? (e.g., 'Monday to Friday' or 'weekdays')"
+            return self._get_multilingual_response("expiry_date_noted", language, input=expiry_date_input, product_name=product_name)
 
     async def _handle_set_price(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Handle setting product price."""
+        language = session_context.get("detected_language", "english")
         user_id = session_context.get("user_id")
         if not user_id:
-            return "Please register first."
+            return self._get_multilingual_response("register_first", language)
 
         unit_price = filled_slots.get("unit_price")
 
         if unit_price is None:
-            return "What's the price per kg in ETB?"
+            return self._get_multilingual_response("what_price", language)
 
         # Check if we have pending product information
         pending_product = session_context.get("pending_product")
         if not pending_product:
-            return "Please tell me which product you want to set the price for."
+            return self._get_multilingual_response("need_product_quantity", language)
 
         product_name = pending_product.get("product_name")
         quantity = pending_product.get("quantity")
 
         if not product_name or quantity is None:
-            return "I need the product name and quantity first."
+            return self._get_multilingual_response("need_product_quantity", language)
 
         # Store the price in pending product info
         pending_product["unit_price"] = unit_price
 
-        return f"Great! I'll set the price at {unit_price} ETB per kg. When does this {product_name} expire? (You can say 'no expiry' if it doesn't expire)"
+        return self._get_multilingual_response("price_set", language, unit_price=unit_price, product_name=product_name)
 
     async def _handle_pricing_insight(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Provide pricing insights."""
+        language = session_context.get("detected_language", "english")
         product_name = filled_slots.get("product_name")
         if not product_name:
-            return "Which product do you need pricing insights for?"
+            return self._get_multilingual_response("what_product_pricing", language)
 
         try:
             # Get competitor prices
@@ -1998,37 +2122,39 @@ Please provide a clear, helpful answer that addresses the user's question using 
             })
 
             if not competitor_prices:
-                return f"No competitor pricing data available for {product_name}."
+                return self._get_multilingual_response("no_competitor_data", language, product_name=product_name)
 
             avg_price = sum(cp.get("price_etb_per_kg", 0) for cp in competitor_prices) / len(competitor_prices)
-            return f"Average competitor price for {product_name}: {avg_price:.2f} ETB per kg."
+            return self._get_multilingual_response("competitor_price", language, product_name=product_name, avg_price=f"{avg_price:.2f}")
 
         except Exception as exc:
             logger.error(f"Failed to get pricing insight: {exc}")
-            return f"I couldn't get pricing insights for {product_name}."
+            return self._get_multilingual_response("pricing_error", language, product_name=product_name)
 
     async def _handle_generate_image(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Generate product image."""
+        language = session_context.get("detected_language", "english")
         product_name = filled_slots.get("product_name")
         if not product_name:
-            return "Which product would you like an image for?"
+            return self._get_multilingual_response("what_product_image", language)
 
         try:
             result = await self.image_generator.run(product_name)
-            return f"Image generated for {product_name}: {result}"
+            return self._get_multilingual_response("image_generated", language, product_name=product_name, result=result)
         except Exception as exc:
             logger.error(f"Failed to generate image: {exc}")
-            return f"I couldn't generate an image for {product_name}."
+            return self._get_multilingual_response("image_error", language, product_name=product_name)
 
     async def _handle_check_stock(
         self, session_context: Dict[str, Any]
     ) -> str:
         """Check supplier's stock."""
+        language = session_context.get("detected_language", "english")
         user_id = session_context.get("user_id")
         if not user_id:
-            return "Please register first."
+            return self._get_multilingual_response("register_first", language)
 
         try:
             products = await self.database_tool.run({
@@ -2039,9 +2165,9 @@ Please provide a clear, helpful answer that addresses the user's question using 
             })
 
             if not products:
-                return "You don't have any products in inventory yet."
+                return self._get_multilingual_response("no_inventory", language)
 
-            response_parts = ["📦 **Your Current Inventory:**"]
+            response_parts = [self._get_multilingual_response("inventory_header", language)]
             for product in products:
                 name = product.get("product", {}).get("product_name_en", "Unknown")
                 quantity = product.get("quantity_available", 0)
@@ -2070,64 +2196,71 @@ Please provide a clear, helpful answer that addresses the user's question using 
                 status_emoji = "✅" if status == "active" else "⏸️" if status == "on_sale" else "❌"
 
                 response_parts.append(
-                    f"{status_emoji} **{name}** • Quantity: {quantity} {unit} • Price: {price} ETB/{unit} • Delivery: {delivery_days}{expiry_info}"
+                    self._get_multilingual_response("inventory_item", language,
+                        status_emoji=status_emoji, name=name, quantity=quantity, unit=unit,
+                        price=price, delivery_days=delivery_days, expiry_info=expiry_info)
                 )
 
             return " ".join(response_parts)
 
         except Exception as exc:
             logger.error(f"Failed to check stock: {exc}")
-            return "I couldn't check your inventory."
+            return self._get_multilingual_response("inventory_error", language)
 
     async def _handle_view_expiring_products(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """View expiring products."""
+        language = session_context.get("detected_language", "english")
         time_horizon = filled_slots.get("time_horizon", "1 week")
-        return f"Checking products expiring within {time_horizon}."
+        return self._get_multilingual_response("expiring_products", language, time_horizon=time_horizon)
 
     async def _handle_accept_flash_sale(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Accept flash sale."""
+        language = session_context.get("detected_language", "english")
         product_name = filled_slots.get("product_name")
         if not product_name:
-            return "Which product flash sale would you like to accept?"
+            return self._get_multilingual_response("what_flash_sale_accept", language)
 
-        return f"Flash sale accepted for {product_name}."
+        return self._get_multilingual_response("flash_sale_accepted", language, product_name=product_name)
 
     async def _handle_decline_flash_sale(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Decline flash sale."""
+        language = session_context.get("detected_language", "english")
         product_name = filled_slots.get("product_name")
         if not product_name:
-            return "Which product flash sale would you like to decline?"
+            return self._get_multilingual_response("what_flash_sale_decline", language)
 
-        return f"Flash sale declined for {product_name}."
+        return self._get_multilingual_response("flash_sale_declined", language, product_name=product_name)
 
     async def _handle_view_delivery_schedule(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """View delivery schedule."""
+        language = session_context.get("detected_language", "english")
         date_range = filled_slots.get("date_range")
         query = "your delivery schedule"
         if date_range:
             query += f" for {date_range}"
 
-        return f"Here's {query}."
+        return self._get_multilingual_response("delivery_schedule", language, date_range=date_range or "all dates")
 
     async def _handle_check_deliveries_by_date(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Check deliveries by date."""
+        language = session_context.get("detected_language", "english")
         user_id = session_context.get("user_id")
         if not user_id:
-            return "Please log in as a supplier first."
+            return self._get_multilingual_response("login_supplier", language)
 
         date = filled_slots.get("date")
         if not date:
-            return "Which date would you like to check deliveries for?"
+            return self._get_multilingual_response("what_date_deliveries", language)
 
         try:
             # Resolve the date to ensure proper format
@@ -2143,7 +2276,7 @@ Please provide a clear, helpful answer that addresses the user's question using 
             })
 
             if not order_items:
-                return f"You have no deliveries scheduled for {resolved_date.strftime('%B %d, %Y')}."
+                return self._get_multilingual_response("no_deliveries_date", language, date=resolved_date.strftime('%B %d, %Y'))
 
             # Filter by delivery date from transactions
             deliveries_today = []
@@ -2173,10 +2306,10 @@ Please provide a clear, helpful answer that addresses the user's question using 
                         })
 
             if not deliveries_today:
-                return f"You have no deliveries scheduled for {resolved_date.strftime('%B %d, %Y')}."
+                return self._get_multilingual_response("no_deliveries_date", language, date=resolved_date.strftime('%B %d, %Y'))
 
             # Format the response
-            response_parts = [f"Your deliveries for {resolved_date.strftime('%B %d, %Y')}:"]
+            response_parts = [self._get_multilingual_response("deliveries_date", language, date=resolved_date.strftime('%B %d, %Y'))]
 
             for delivery in deliveries_today[:10]:  # Limit to 10 deliveries
                 product_name = "Unknown product"
@@ -2201,15 +2334,16 @@ Please provide a clear, helpful answer that addresses the user's question using 
 
         except Exception as exc:
             logger.error(f"Failed to check deliveries by date: {exc}")
-            return f"I couldn't check your deliveries for {date}. Please try again."
+            return self._get_multilingual_response("deliveries_error", language, date=date)
 
     async def _handle_supplier_check_deliveries(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Handle supplier checking their deliveries/orders."""
+        language = session_context.get("detected_language", "english")
         user_id = session_context.get("user_id")
         if not user_id:
-            return "Please log in as a supplier first."
+            return self._get_multilingual_response("login_supplier", language)
 
         date_filter = filled_slots.get("date")
         order_ref = filled_slots.get("order_reference")
@@ -2219,7 +2353,7 @@ Please provide a clear, helpful answer that addresses the user's question using 
             pending_orders = await self._get_supplier_pending_orders(user_id)
 
             if not pending_orders:
-                return "You have no pending orders at this time."
+                return self._get_multilingual_response("no_pending_orders", language)
 
             # If a specific date is requested, we could filter further, but for now just return all pending
             # The _get_supplier_pending_orders already filters for pending/confirmed status
@@ -2228,37 +2362,39 @@ Please provide a clear, helpful answer that addresses the user's question using 
             if order_ref:
                 # This is a simple implementation - in practice might need better matching
                 if order_ref.lower() not in pending_orders.lower():
-                    return f"I couldn't find an order with reference '{order_ref}' in your pending orders."
+                    return self._get_multilingual_response("order_not_found", language, order_ref=order_ref)
 
             return pending_orders
 
         except Exception as exc:
             logger.error(f"Failed to check supplier deliveries: {exc}")
-            return "I couldn't check your deliveries right now. Please try again."
+            return self._get_multilingual_response("deliveries_error", language, date="this period")
 
     async def _handle_accept_order(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Accept order."""
+        language = session_context.get("detected_language", "english")
         order_ref = filled_slots.get("order_reference")
         if not order_ref:
-            return "Which order would you like to accept?"
+            return self._get_multilingual_response("what_order_accept", language)
 
-        return f"Order {order_ref} accepted."
+        return self._get_multilingual_response("order_accepted", language, order_ref=order_ref)
 
     async def _handle_update_inventory(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
     ) -> str:
         """Handle updating existing inventory quantity."""
+        language = session_context.get("detected_language", "english")
         user_id = session_context.get("user_id")
         if not user_id:
-            return "Please register first."
+            return self._get_multilingual_response("register_first", language)
 
         product_name = filled_slots.get("product_name")
         quantity = filled_slots.get("quantity")
 
         if not product_name or quantity is None:
-            return "What product and how much quantity do you want to add?"
+            return self._get_multilingual_response("what_product_quantity_update", language)
 
         try:
             # Find the product
@@ -2270,7 +2406,7 @@ Please provide a clear, helpful answer that addresses the user's question using 
             })
 
             if not product:
-                return f"I couldn't find {product_name} in your inventory. Please add it as a new product first."
+                return self._get_multilingual_response("product_not_found", language, product_name=product_name)
 
             # Check if supplier already has this product
             supplier_products = await self.database_tool.run({
@@ -2281,7 +2417,7 @@ Please provide a clear, helpful answer that addresses the user's question using 
             })
 
             if not supplier_products:
-                return f"You don't have {product_name} in your inventory yet. Please add it as a new product first."
+                return self._get_multilingual_response("not_in_inventory", language, product_name=product_name)
 
             # Update existing inventory - add to current quantity
             existing_product = supplier_products[0]
@@ -2297,8 +2433,11 @@ Please provide a clear, helpful answer that addresses the user's question using 
                 "kwargs": update_kwargs
             })
 
-            return f"Added {quantity} kg to your existing {product_name} inventory. Total quantity now: {new_quantity} kg at {existing_product.get('unit_price_etb', 'current price')} ETB per kg, deliverable {existing_product.get('available_delivery_days', 'existing schedule')}."
+            return self._get_multilingual_response("inventory_updated", language,
+                quantity=quantity, product_name=product_name, new_quantity=new_quantity,
+                current_price=existing_product.get('unit_price_etb', 'current price'),
+                delivery_days=existing_product.get('available_delivery_days', 'existing schedule'))
 
         except Exception as exc:
             logger.error(f"Failed to update inventory: {exc}")
-            return f"I couldn't update your {product_name} inventory. Please try again."
+            return self._get_multilingual_response("inventory_update_error", language, product_name=product_name)
