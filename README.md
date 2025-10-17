@@ -85,6 +85,8 @@ Ensure you have Python 3.11+, PostgreSQL, Milvus running, and API keys set up as
 
 5. Generate seed data:
 
+   - The `generate_data.py` is in app/utils.
+
    ```powershell
    python -m app.utils.generate_data insert
    ```
