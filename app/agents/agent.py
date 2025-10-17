@@ -31,21 +31,6 @@ class Agent:
         self.date_resolver = DateResolverTool(llm_service=self.llm_service)
         self.image_generator = ImageGeneratorTool()
 
-        # Initialize handler classes
-        self.customer_handlers = CustomerHandlers(
-            database_tool=self.database_tool,
-            vector_search=self.vector_search,
-            date_resolver=self.date_resolver,
-            llm_service=self.llm_service
-        )
-        self.supplier_handlers = SupplierHandlers(
-            database_tool=self.database_tool,
-            vector_search=self.vector_search,
-            date_resolver=self.date_resolver,
-            llm_service=self.llm_service,
-            image_generator=self.image_generator
-        )
-
         # Tool registry for dynamic access
         self.tools = {
             "intent_classifier": self.intent_classifier,
@@ -211,38 +196,7 @@ class Agent:
             missing_slots = intent_result.get("missing_slots", [])
             suggested_tools = intent_result.get("suggested_tools", [])
 
-            # Check if we can fill missing slots from a previous intent
-            current_intent = session_context.get("current_intent")
-            current_filled_slots = session_context.get("filled_slots", {})
-            current_missing_slots = session_context.get("missing_slots", [])
-
-            if current_intent and current_missing_slots:
-                # If the new message can fill slots for the current intent, merge them
-                can_fill_slots = False
-                slot_mapping = {
-                    "delivery_date": "preferred_delivery_date",  # Map delivery_date to preferred_delivery_date
-                    # Add other mappings as needed
-                }
-                
-                for slot in current_missing_slots:
-                    if slot in filled_slots:
-                        current_filled_slots[slot] = filled_slots[slot]
-                        can_fill_slots = True
-                    elif slot_mapping.get(slot) in filled_slots:
-                        current_filled_slots[slot] = filled_slots[slot_mapping[slot]]
-                        can_fill_slots = True
-
-                if can_fill_slots:
-                    # Update missing slots
-                    updated_missing_slots = [slot for slot in current_missing_slots if slot not in current_filled_slots]
-                    # Keep the current intent if slots were filled
-                    intent = current_intent
-                    flow = session_context.get("current_flow", flow)
-                    filled_slots = current_filled_slots
-                    missing_slots = updated_missing_slots
-                    suggested_tools = session_context.get("suggested_tools", suggested_tools)
-
-            logger.info(f"Final intent: {intent}, flow: {flow}, missing_slots: {missing_slots}")
+            logger.info(f"Classified intent: {intent}, flow: {flow}, missing_slots: {missing_slots}")
 
             # Update session context with current intent and flow
             session_context.update({
@@ -250,7 +204,6 @@ class Agent:
                 "current_flow": flow,
                 "filled_slots": filled_slots,
                 "missing_slots": missing_slots,
-                "suggested_tools": suggested_tools,
                 "last_user_message": user_message,  # Store the original user message
             })
 
@@ -540,7 +493,192 @@ class Agent:
             logger.error(f"Failed to verify account: {exc}")
             return self._get_multilingual_response("error_generic", language)
 
+    async def _get_supplier_dashboard_info(self, supplier_id: int) -> str:
+        """Get dashboard information for supplier login."""
+        try:
+            dashboard_parts = []
 
+            # Get pending orders
+            pending_orders = await self._get_supplier_pending_orders(supplier_id)
+            if pending_orders:
+                dashboard_parts.append(pending_orders)
+
+            # Get expiring products and flash sale suggestions
+            expiring_info = await self._get_supplier_expiring_products_and_suggestions(supplier_id)
+            if expiring_info:
+                dashboard_parts.append(expiring_info)
+
+            if not dashboard_parts:
+                return "You have no pending orders or expiring products at this time."
+
+            return " ".join(dashboard_parts)
+
+        except Exception as exc:
+            logger.error(f"Failed to get supplier dashboard info: {exc}")
+            return "I couldn't load your dashboard information right now."
+
+    async def _get_supplier_pending_orders(self, supplier_id: int) -> str:
+        """Get pending orders for a supplier."""
+        try:
+            # Query order items for this supplier
+            order_items = await self.database_tool.run({
+                "table": "order_items",
+                "method": "list_order_items",
+                "args": [],
+                "kwargs": {"filters": {"supplier": supplier_id}}
+            })
+
+            if not order_items:
+                return ""
+
+            # Filter for pending/confirmed orders
+            pending_orders = []
+            for item in order_items:
+                # Get the transaction for this order item
+                transaction = await self.database_tool.run({
+                    "table": "transactions",
+                    "method": "get_transaction_by_id",
+                    "args": [item["order"]["order_id"]],
+                    "kwargs": {}
+                })
+
+                if transaction and transaction.get("status") in ["Pending", "Confirmed"]:
+                    pending_orders.append({
+                        "order_id": transaction["order_id"],
+                        "customer": transaction.get("user", "Unknown customer"),
+                        "product": item.get("product", "Unknown product"),
+                        "quantity": item.get("quantity", 0),
+                        "unit": item.get("unit", "kg"),
+                        "delivery_date": transaction.get("delivery_date"),
+                        "status": transaction.get("status", "Unknown")
+                    })
+
+            if not pending_orders:
+                return ""
+
+            # Format the response as a single line paragraph
+            order_descriptions = []
+            for order in pending_orders[:5]:  # Show up to 5 orders
+                product_name = "Unknown product"
+                if isinstance(order["product"], dict):
+                    product_name = order["product"].get("product_name_en", "Unknown product")
+
+                customer_name = "Unknown customer"
+                if isinstance(order["customer"], dict):
+                    customer_name = order["customer"].get("name", "Unknown customer")
+
+                customer_location = "Unknown location"
+                if isinstance(order["customer"], dict):
+                    customer_location = order["customer"].get("default_location", "Unknown location")
+
+                delivery_info = ""
+                if order["delivery_date"]:
+                    try:
+                        from datetime import datetime
+                        if isinstance(order["delivery_date"], str):
+                            if 'T' in order["delivery_date"]:
+                                delivery_date = order["delivery_date"].split('T')[0]
+                            else:
+                                delivery_date = order["delivery_date"]
+                            date_obj = datetime.fromisoformat(delivery_date.replace('Z', '+00:00'))
+                            delivery_info = f" - Delivery: {date_obj.strftime('%b %d')}"
+                    except:
+                        delivery_info = f" - Delivery: {order['delivery_date']}"
+
+                order_descriptions.append(
+                    f"Order {str(order['order_id'])[:8]}...: {product_name} "
+                    f"({order['quantity']} {order['unit']}) for {customer_name} in {customer_location}{delivery_info} - {order['status']}"
+                )
+
+            if len(pending_orders) > 5:
+                order_descriptions.append(f"and {len(pending_orders) - 5} more pending orders")
+
+            return "📦 **Pending Orders:** " + ", ".join(order_descriptions) + "."
+
+        except Exception as exc:
+            logger.error(f"Failed to get supplier pending orders: {exc}")
+            return ""
+
+    async def _get_supplier_expiring_products_and_suggestions(self, supplier_id: int) -> str:
+        """Get expiring products and flash sale suggestions for a supplier."""
+        try:
+            # Get expiring products (within 7 days)
+            expiring_products = await self.database_tool.run({
+                "table": "supplier_products",
+                "method": "get_expiring_products",
+                "args": [supplier_id, 7],
+                "kwargs": {}
+            })
+
+            if not expiring_products:
+                return ""
+
+            # Generate flash sale suggestions
+            await self.database_tool.run({
+                "table": "supplier_products",
+                "method": "generate_flash_sale_proposals",
+                "args": [supplier_id],
+                "kwargs": {"within_days": 7, "default_discount": 25.0}
+            })
+
+            # Get proposed flash sales
+            proposed_sales = await self.database_tool.run({
+                "table": "flash_sales",
+                "method": "list_flash_sales",
+                "args": [],
+                "kwargs": {"filters": {"supplier": supplier_id, "status": "proposed"}}
+            })
+
+            # Format the response
+            response_parts = ["⚠️ **Expiring Products (next 7 days):**"]
+
+            for product in expiring_products[:5]:  # Show up to 5 products
+                product_name = "Unknown product"
+                if isinstance(product.get("product"), dict):
+                    product_name = product["product"].get("product_name_en", "Unknown product")
+
+                expiry_date = product.get("expiry_date")
+                expiry_info = "Unknown expiry"
+                if expiry_date:
+                    try:
+                        from datetime import datetime
+                        if isinstance(expiry_date, str):
+                            date_obj = datetime.fromisoformat(expiry_date.replace('Z', '+00:00'))
+                            expiry_info = date_obj.strftime('%b %d')
+                        else:
+                            expiry_info = str(expiry_date)
+                    except:
+                        expiry_info = str(expiry_date)
+
+                quantity = product.get("quantity_available", 0)
+                unit = product.get("unit", "kg")
+
+                response_parts.append(
+                    f"• {product_name}: {quantity} {unit} expires {expiry_info}"
+                )
+
+            if len(expiring_products) > 5:
+                response_parts.append(f"... and {len(expiring_products) - 5} more expiring products.")
+
+            # Add flash sale suggestions
+            if proposed_sales:
+                response_parts.append("💡 **Flash Sale Suggestions:**")
+                response_parts.append("I've created flash sale proposals for your expiring products with 25% discount.")
+                response_parts.append("You can accept these to attract customers and reduce waste.")
+
+                for sale in proposed_sales[:3]:  # Show up to 3 suggestions
+                    product_name = "Unknown product"
+                    if isinstance(sale.get("product"), dict):
+                        product_name = sale["product"].get("product_name_en", "Unknown product")
+
+                    discount = sale.get("discount_percent", 0)
+                    response_parts.append(f"• {product_name}: {discount}% off until expiry")
+
+            return " ".join(response_parts)
+
+        except Exception as exc:
+            logger.error(f"Failed to get supplier expiring products: {exc}")
+            return ""
 
     async def _handle_new_user_registration(
         self, filled_slots: Dict[str, Any], session_context: Dict[str, Any]
